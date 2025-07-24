@@ -1,15 +1,28 @@
-# MiFi: WiFi Signal Tracking & Cracking Toolkit
+# WiFi Handshake Collector and Processor Tool
 
-This toolkit provides advanced WiFi handshake collection, signal mapping, and web-based visualization for site surveys and security testing. It consists of a CLI tool (`mifi`), a persistent web dashboard (`wifi_dashboard.py`), and helper scripts for WPA cracking (`john/`, `hc/`).
+> Developed for educational and ethical use in RF analysis and cyber projects.
 
 ---
 
-## Features
-- **WiFi handshake collection and processing** (with aircrack-ng, John the Ripper, Hashcat)
-- **Signal mapping with GPS** for site surveys and heatmaps
-- **Persistent web dashboard** for interactive map visualization, filtering, and analysis
-- **Modern, filterable UI** with satellite/OSM map options, session/ESSID filtering, and value filters
-- **Helper scripts for advanced WPA cracking** (John the Ripper, Hashcat)
+## Overview
+
+This tool is designed to assist in the **collection and analysis of WPA2 WiFi handshakes**. It supports both **manual and automated workflows** and is ideal for research or academic demonstrations involving wireless network security.
+
+The tool separates collection and processing into modular stages to improve usability and performance—especially on systems with limited resources.
+
+---
+
+## Modes of Operation
+
+| Mode         | Description                                                                 |
+|--------------|-----------------------------------------------------------------------------|
+| `collect-*`  | Scans for nearby access points (APs) and can optionally target specific networks for a deauthentication capture. |
+| `process-*`  | Processes stored EAPOL PCAPs to isolate hashes and analyze handshake data.  |
+| `full-*`     | Runs both `collect` and `process` phases in sequence.                       |
+| `*-manual`   | Manual selection of targets and input files. Requires terminal interaction. |
+| `*-auto`     | Automatically captures and processes all WPA2 networks and PCAPs found.     |
+| `target`     | Waits for a specific ESSID to appear and captures its handshake.            |
+| `config`     | Prepares interface for **headless** operation (non-interactive). 
 
 ---
 
@@ -65,31 +78,10 @@ sudo ./mifi --mode collect-manual
 sudo ./mifi --mode collect-auto
 ```
 
-#### **Targeted Handshake Capture**
-```bash
-sudo ./mifi --mode target --TID "MyNetwork"
-```
-
-#### **Mapping Mode (Signal Survey with GPS)**
-```bash
-sudo ./mifi --mode map -MS 10 -MSD 5 --gps-port /dev/ttyUSB0
-```
-
 #### **Full Pipeline (Collect + Process)**
 ```bash
 sudo ./mifi --mode full-auto
 ```
-
-#### **Start the Web Dashboard**
-```bash
-./mifi --mode dashboard
-# or
-python3 wifi_dashboard.py
-```
-
-#### **Access the Dashboard**
-- Open a browser and go to: `http://localhost:5000`
-- Or, from another computer on the network: `http://<your-server-ip>:5000`
 
 ---
 
@@ -132,8 +124,6 @@ python3 hash_cat.py
 ```
 /MiFi/
 ├── mifi.py              # Main CLI tool (builds to ./mifi)
-├── wifi_dashboard.py    # Persistent web dashboard (Flask)
-├── requirements.txt     # Python dependencies
 ├── networks.db          # SQLite database (auto-created)
 ├── tracking/            # Output directory for exports
 ├── logs/                # Application logs
