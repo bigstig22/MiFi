@@ -1,0 +1,16 @@
+# WiFi Cracker Requirements
+
+# Core dependencies
+tabulate>=0.8.9
+
+# GPS tracking dependencies
+pyserial>=3.5
+
+# Web dashboard dependencies
+flask>=2.0
+
+# Optional: For enhanced GPS parsing (if needed)
+# pynmea2>=1.18.0
+
+# Optional: For advanced GPS functionality (if needed)
+# gpsd-py3>=3.0.0 
