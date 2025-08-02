@@ -45,7 +45,7 @@ class wifi_cracker:
         
     
     def initial_config(self):
-        self.check_and_create_directories()
+        self.check_directories()
 
     def configure_interface(self):
         """
@@ -516,7 +516,7 @@ class wifi_cracker:
             "Timestamp": timestamp
         }
 
-    def check_and_create_directories(self):
+    def check_directories(self):
         """
         Checks for the existence of required directories and the SQLite 
         database. Creates them if they do not exist.
@@ -525,18 +525,31 @@ class wifi_cracker:
 
         for directory_path in self.directories:
             if not os.path.exists(directory_path):
-                self.log(f"Directory '{directory_path}' does not exist. Creating it now.", indent=4, prefix="error")
-                os.makedirs(directory_path)
+                self.log(f"Directory '{directory_path}' does not exist. Run setup.sh", indent=4, prefix="x")
+                sys.exit(1)
+                #os.makedirs(directory_path)
             else:
                 self.log(f"Directory '{directory_path}' already exists.", indent=4, prefix="check")
 
-        # Check for SQLite database
-        self.db_file = "networks.db"
+        # Step 1: Check if database file exists
         if not os.path.exists(self.db_file):
-            self.log(f"Database '{self.db_file}' does not exist. Initializing it now.", indent=4, prefix="error")
+            self.log(f"Database '{self.db_file}' does not exist. Run setup.sh", indent=4, prefix="x")
+            sys.exit(1)
+
+        self.log(f"Database '{self.db_file}' already exists.", indent=4, prefix="check")
+
+        # Step 2: Check if 'networks' table exists
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='networks';")
+        result = c.fetchone()
+
+        if result is None:
+            self.log("Table 'networks' does not exist, creating now...", indent=8, prefix="error")
             self.init_database()
-        else:
-            self.log(f"Database '{self.db_file}' already exists.", indent=4, prefix="check")
+
+        conn.close()
 
     def scan_networks(self):
         """
@@ -1101,7 +1114,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--version", 
         action="version", 
-        version=f"CLI Crack {__version__}"
+        version=f"MiFi VERSION {__version__}"
     )
 
     parser.add_argument(

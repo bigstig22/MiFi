@@ -28,10 +28,10 @@ The tool separates collection and processing into modular stages to improve usab
 
 ## Requirements
 
-### Hardware
+### System
+- sudo privs
 - WiFi card capable of monitor mode
-- USB GPS module (optional, for mapping)
-- Computer with USB ports
+- USB GPS module (optional, for mapping modes)
 
 ### Software (Linux/Debian/Ubuntu)
 ```bash
@@ -66,7 +66,14 @@ pip3 install -r requirements.txt
 
 ## Usage
 
-### 1. **Collecting Data (CLI)**
+### 1. **Initial Setup**
+```bash
+chmod +x setup.sh
+./setup.sh
+python3 mifi.py -h
+```
+
+### 2. **Collecting Data (CLI)**
 
 #### **Basic Scan/Collection**
 ```bash
@@ -142,12 +149,6 @@ python3 hash_cat.py
 
 ## Troubleshooting
 
-- **Database permissions:** If you run `mifi` with `sudo`, the database (`networks.db`) will be owned by root. After running, fix permissions so the web dashboard can access it:
-  ```bash
-  sudo chown $USER:$USER /MiFi/networks.db
-  ```
-- **No data in dashboard:** Make sure you have run mapping mode at least once and the database is not empty.
-- **GPS not detected:** Check your USB port and permissions. Try adding your user to the `dialout` group.
 - **Monitor mode issues:** Ensure your WiFi card supports monitor mode and is not blocked by rfkill.
 
 ---
