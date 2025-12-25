@@ -1,16 +1,12 @@
-# WiFi Cracker Requirements
+# MiFi: WiFi Signal Tracking & Cracking Toolkit
+# Python Dependencies
 
-# Core dependencies
+# Core CLI dependencies
 tabulate>=0.8.9
 
 # GPS tracking dependencies
 pyserial>=3.5
+gps3>=0.33.3
 
 # Web dashboard dependencies
-flask>=2.0
-
-# Optional: For enhanced GPS parsing (if needed)
-# pynmea2>=1.18.0
-
-# Optional: For advanced GPS functionality (if needed)
-# gpsd-py3>=3.0.0 
+flask>=2.0.0 

@@ -61,6 +61,7 @@ class wifi_cracker:
         os.makedirs("logs", exist_ok=True)
         
         self.latest_gps_position = None
+        self.gps_position_last_updated = None
         self.gps_thread = None
         self.gps_thread_stop = threading.Event()
         self.gps_lock = threading.Lock()
@@ -688,9 +689,9 @@ class wifi_cracker:
         elif mode == "auto":
             self.collect_auto_mode(packets, target_scan, initial_scan)
         else:
-            self.collect_manual_mode(initial_scan, target_scan)
+            self.collect_manual_mode(initial_scan, target_scan, packets)
 
-    def collect_manual_mode(self, initial_scan=None, target_scan=None):
+    def collect_manual_mode(self, initial_scan=None, target_scan=None, packets=None):
         """
         Manual mode: allows repeated manual selection of ESSIDs 
         until the user chooses to quit.
@@ -1054,10 +1055,42 @@ class wifi_cracker:
             self.log(f"Failed to initialize GPS on {port}: {e}", prefix="error")
             return False
 
-    def start_gps_polling(self, gps_host="127.0.0.1", gps_port=2947, poll_interval=0.5):
+    def check_gpsd_running(self, gps_host="127.0.0.1", gps_port=2947):
+        """
+        Check if gpsd is running and accessible.
+        """
+        try:
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            result = sock.connect_ex((gps_host, gps_port))
+            sock.close()
+            return result == 0
+        except Exception:
+            return False
+
+    def start_gps_polling(self, gps_host="127.0.0.1", gps_port=2947, poll_interval=0.5, gps_device=None):
         """
         Starts a background thread that polls gpsd for the latest GPS fix every poll_interval seconds using gps3.
+        Continuously updates the latest GPS position as new data arrives.
+        
+        Args:
+            gps_device: USB device path (e.g., /dev/ttyUSB0) - used for gpsd setup instructions if not running
         """
+        # Check if gpsd is running
+        if not self.check_gpsd_running(gps_host, gps_port):
+            self.log("gpsd is not running or not accessible.", prefix="error")
+            if gps_device:
+                self.log(f"To start gpsd with your GPS device, run:", prefix="error")
+                self.log(f"  sudo gpsd {gps_device} -F /var/run/gpsd.sock", indent=4, prefix="blank")
+                self.log(f"Or install and start gpsd service:", indent=4, prefix="blank")
+                self.log(f"  sudo apt install gpsd gpsd-clients", indent=4, prefix="blank")
+                self.log(f"  sudo systemctl start gpsd", indent=4, prefix="blank")
+                self.log(f"  sudo systemctl enable gpsd", indent=4, prefix="blank")
+            else:
+                self.log("Please ensure gpsd is running on port 2947", prefix="error")
+            return False
+        
         self.gps_thread_stop.clear()
         def poll():
             gps_socket = gps3.GPSDSocket()
@@ -1065,38 +1098,80 @@ class wifi_cracker:
             try:
                 gps_socket.connect(host=gps_host, port=gps_port)
                 gps_socket.watch()
+                self.log("Connected to gpsd successfully.", indent=4, prefix="check")
+                # Give gpsd a moment to start sending data
+                time.sleep(0.5)
             except Exception as e:
                 self.log(f"Failed to connect to gpsd: {e}", prefix="error")
+                self.log("Make sure gpsd is running: sudo systemctl start gpsd", indent=4, prefix="error")
+                with self.gps_lock:
+                    self.latest_gps_position = None
+                    self.gps_position_last_updated = None
                 return
+            # Continuously read GPS data as it arrives
             for new_data in gps_socket:
                 if self.gps_thread_stop.is_set():
                     break
-                if new_data:
-                    try:
-                        data_stream.unpack(new_data)
-                        # Only update if we have a valid fix
-                        if getattr(data_stream, 'TPV', None):
-                            tpv = data_stream.TPV
-                            mode = tpv.get('mode', 0)
-                            if mode >= 2:
-                                pos = {
-                                    'latitude': tpv.get('lat'),
-                                    'longitude': tpv.get('lon'),
-                                    'altitude': tpv.get('alt'),
-                                    'timestamp': tpv.get('time')
-                                }
-                                with self.gps_lock:
-                                    self.latest_gps_position = pos
-                            else:
-                                with self.gps_lock:
-                                    self.latest_gps_position = None
-                    except Exception as e:
-                        with self.gps_lock:
-                            self.latest_gps_position = None
-                self.gps_thread_stop.wait(poll_interval)
+                if not new_data:
+                    continue
+                try:
+                    data_stream.unpack(new_data)
+                    # Check if we have TPV data - TPV is a dict-like object in gps3
+                    # In gps3, TPV is accessed as data_stream.TPV and it's a dict
+                    if hasattr(data_stream, 'TPV'):
+                        tpv = data_stream.TPV
+                        if tpv:  # TPV exists and is not empty
+                            # TPV in gps3 is a dict, use .get() method
+                            try:
+                                mode = tpv.get('mode', 0)
+                                lat = tpv.get('lat')
+                                lon = tpv.get('lon')
+                                alt = tpv.get('alt')
+                                ts = tpv.get('time')
+                                
+                                # Update position if we have valid coordinates (mode >= 2) and valid lat/lon
+                                if mode is not None and mode >= 2 and lat is not None and lon is not None:
+                                    pos = {
+                                        'latitude': float(lat),
+                                        'longitude': float(lon),
+                                        'altitude': float(alt) if alt is not None else None,
+                                        'timestamp': ts
+                                    }
+                                    with self.gps_lock:
+                                        self.latest_gps_position = pos
+                                        self.gps_position_last_updated = time.time()
+                            except (AttributeError, TypeError, ValueError) as e:
+                                # TPV might not have .get() method, try direct access
+                                try:
+                                    mode = getattr(tpv, 'mode', 0)
+                                    lat = getattr(tpv, 'lat', None)
+                                    lon = getattr(tpv, 'lon', None)
+                                    alt = getattr(tpv, 'alt', None)
+                                    ts = getattr(tpv, 'time', None)
+                                    
+                                    if mode is not None and mode >= 2 and lat is not None and lon is not None:
+                                        pos = {
+                                            'latitude': float(lat),
+                                            'longitude': float(lon),
+                                            'altitude': float(alt) if alt is not None else None,
+                                            'timestamp': ts
+                                        }
+                                        with self.gps_lock:
+                                            self.latest_gps_position = pos
+                                            self.gps_position_last_updated = time.time()
+                                except Exception:
+                                    pass
+                except Exception as e:
+                    # Don't clear on every error - might be transient
+                    if self.verbose:
+                        self.log(f"GPS polling error: {e}", prefix="error")
+                    # Keep last known position on error
+                    pass
         self.gps_thread = threading.Thread(target=poll, daemon=True)
         self.gps_thread.start()
         self.log("Started GPS polling thread using gps3.", prefix="check")
+        # Give the polling thread a moment to connect and start receiving data
+        time.sleep(1.0)
         return True
 
     def stop_gps_polling(self):
@@ -1112,9 +1187,18 @@ class wifi_cracker:
     def get_gps_position(self):
         """
         Returns the latest GPS position from the polling thread (if available).
+        Returns a copy to avoid race conditions.
         """
         with self.gps_lock:
-            return self.latest_gps_position.copy() if self.latest_gps_position else None
+            if self.latest_gps_position:
+                # Return a deep copy to ensure we get the current state
+                return {
+                    'latitude': self.latest_gps_position.get('latitude'),
+                    'longitude': self.latest_gps_position.get('longitude'),
+                    'altitude': self.latest_gps_position.get('altitude'),
+                    'timestamp': self.latest_gps_position.get('timestamp')
+                }
+            return None
 
     def _nmea_to_decimal(self, nmea_coord, direction):
         """
@@ -1146,39 +1230,63 @@ class wifi_cracker:
                 self.log("GPS initialization failed. Ensure GPS is connected and try again.", prefix="x")
                 sys.exit(1)
 
-        def wait_for_new_gps_fix(last_timestamp):
+        def get_fresh_gps_fix():
+            """Get the most current GPS position from the device."""
             gps_wait_attempts = 0
+            last_seen_position = None
             while gps_wait_attempts < gps_lock_attempts:
+                # Get the latest GPS position
                 gps_data = self.get_gps_position()
-                if gps_data and gps_data.get('latitude') and gps_data.get('longitude'):
-                    # Only return if timestamp is new
-                    if gps_data.get('timestamp') and gps_data.get('timestamp') != last_timestamp:
-                        print(gps_data)
-                        return gps_data
+                
+                # Check if we have valid GPS data
+                if gps_data and gps_data.get('latitude') is not None and gps_data.get('longitude') is not None:
+                    # Check if this is a new position (different coordinates or first time)
+                    is_new_position = (
+                        last_seen_position is None or
+                        abs(gps_data.get('latitude', 0) - last_seen_position.get('latitude', 0)) > 0.000001 or
+                        abs(gps_data.get('longitude', 0) - last_seen_position.get('longitude', 0)) > 0.000001 or
+                        gps_data.get('timestamp') != last_seen_position.get('timestamp')
+                    )
+                    
+                    if is_new_position:
+                        # Wait a brief moment to ensure we have the freshest data
+                        time.sleep(0.3)
+                        # Get it again to ensure we have the absolute latest
+                        fresh_gps_data = self.get_gps_position()
+                        if fresh_gps_data and fresh_gps_data.get('latitude') is not None and fresh_gps_data.get('longitude') is not None:
+                            print(fresh_gps_data)
+                            return fresh_gps_data
+                    else:
+                        # Same position - wait a bit longer for GPS to update
+                        if self.verbose:
+                            self.log(f"GPS position unchanged, waiting for update...", indent=8, prefix="error")
+                        time.sleep(1.0)
+                        continue
+                else:
+                    # No valid GPS data - show None for troubleshooting
+                    if self.verbose:
+                        self.log(f"No valid GPS data (got: {gps_data})", indent=8, prefix="error")
+                    print(f"GPS data: {gps_data}")
+                
                 if self.verbose:
                     if gps_wait_attempts == 0:
-                        self.log("Waiting for new GPS fix before next scan...", indent=4, prefix="error")
+                        self.log("Waiting for GPS fix...", indent=4, prefix="error")
                     else:
-                        self.log(f"No new GPS fix yet. Retrying in {gps_lock_wait} seconds... (Attempt {gps_wait_attempts+1}/{gps_lock_attempts})", indent=8, prefix="error")
+                        self.log(f"No GPS fix yet. Retrying in {gps_lock_wait} seconds... (Attempt {gps_wait_attempts+1}/{gps_lock_attempts})", indent=8, prefix="error")
                 gps_wait_attempts += 1
                 time.sleep(gps_lock_wait)
-            self.log(f"No new GPS fix after {gps_lock_attempts} attempts. Exiting.", prefix="x")
+            self.log(f"No GPS fix after {gps_lock_attempts} attempts. Exiting.", prefix="x")
             sys.exit(1)
-
-        last_gps_timestamp = None
 
         try:
             for attempt in range(1, max_attempts + 1):
                 self.log(f"[Scan Attempt {attempt}/{max_attempts}]", prefix="moved")
 
-                # Step 1: Wait for a new GPS fix
-                self.log(f"Acquiring new GPS location...", indent=4, prefix="dot")
-                gps_data = wait_for_new_gps_fix(last_gps_timestamp)
+                # Step 1: Get fresh GPS fix
+                self.log(f"Acquiring GPS location...", indent=4, prefix="dot")
+                gps_data = get_fresh_gps_fix()
                 if self.verbose:
-                    self.log(f"GPS location: {gps_data}", indent=8, prefix="dot")
-                last_gps_timestamp = gps_data.get('timestamp')
-                if self.verbose:
-                    self.log(f"GPS location: {gps_data['latitude']:.6f}, {gps_data['longitude']:.6f} (timestamp: {last_gps_timestamp})", indent=8, prefix="check")
+                    self.log(f"GPS location: {gps_data['latitude']:.6f}, {gps_data['longitude']:.6f} (timestamp: {gps_data.get('timestamp')})", indent=8, prefix="check")
 
                 # Step 2: Immediately scan for networks
                 if not self.scan_networks(timeout=scan_interval):
@@ -1213,12 +1321,40 @@ class wifi_cracker:
     def record_signal_data(self, essid, bssid, channel, signal_strength, gps_data, session_id):
         """
         Record a signal strength data point with GPS coordinates to the database.
+        Each scan records the current GPS location at the time of the scan.
         """
         now = datetime.now().isoformat()
         
         conn = sqlite3.connect(self.db_file)
         c = conn.cursor()
         
+        # Get initial values from first record of this network in this session (if exists)
+        c.execute('''
+            SELECT initial_latitude, initial_longitude, initial_altitude, initial_timestamp, initial_signal_strength
+            FROM signal_tracking
+            WHERE essid = ? AND bssid = ? AND session_id = ?
+            ORDER BY timestamp ASC
+            LIMIT 1
+        ''', (essid, bssid, session_id))
+        
+        existing_record = c.fetchone()
+        
+        # If this is the first time seeing this network in this session, use current GPS as initial
+        if existing_record is None:
+            initial_latitude = gps_data['latitude'] if gps_data else None
+            initial_longitude = gps_data['longitude'] if gps_data else None
+            initial_altitude = gps_data['altitude'] if gps_data else None
+            initial_timestamp = gps_data.get('timestamp') if gps_data else now
+            initial_signal_strength = signal_strength
+        else:
+            # Use the initial values from the first record of this network in this session
+            initial_latitude = existing_record[0]
+            initial_longitude = existing_record[1]
+            initial_altitude = existing_record[2]
+            initial_timestamp = existing_record[3]
+            initial_signal_strength = existing_record[4]
+        
+        # Store current GPS coordinates (these will be different for each scan if device is moving)
         c.execute('''
             INSERT INTO signal_tracking (
                 essid, bssid, channel, signal_strength, 
@@ -1232,11 +1368,11 @@ class wifi_cracker:
             gps_data['longitude'] if gps_data else None,
             gps_data['altitude'] if gps_data else None,
             now, session_id,
-            self.initial_signal_strength,
-            self.initial_gps_position['latitude'] if self.initial_gps_position else None,
-            self.initial_gps_position['longitude'] if self.initial_gps_position else None,
-            self.initial_gps_position['altitude'] if self.initial_gps_position else None,
-            self.initial_gps_position['timestamp'] if self.initial_gps_position else None
+            initial_signal_strength,
+            initial_latitude,
+            initial_longitude,
+            initial_altitude,
+            initial_timestamp
         ))
         
         conn.commit()
@@ -1338,7 +1474,7 @@ if __name__ == "__main__":
     │                   in the collection directory.                       │
     │    • target     → Runs scanning on specific essid until it is        │
     │                   detected and an EAPOL handshake is intercepted.    │
-    │    • map      → Maps all detected networks and their signal          │
+    │    • map        → Maps all detected networks and their signal        │
     │                   strengths with GPS for site surveys and heatmaps.  │
     │    • config     → Configures interface for headless operation.       │
     │    • dashboard  → Starts the persistent web dashboard server.        │
@@ -1351,8 +1487,6 @@ if __name__ == "__main__":
     │    • John the Ripper Jumbo (for wpapcap2john)                        │
     │    • rockyou.txt (or specify another file)                           │
     │                                                                      │
-    │  Install on Debian/Ubuntu:                                           │
-    │    sudo apt install aircrack-ng john                                 │
     ├──────────────────────────────────────────────────────────────────────┤
     │  General Usage:                                                      │
     │    This program is designed to aid in the collection and processing  │
@@ -1361,7 +1495,7 @@ if __name__ == "__main__":
     │    systems. This program segments the collection and processing      │
     │    aspects to aid in this limitation. Hashcat and JTR functions      │
     │    are available within their respective folders for these purposes. │
-    │    I would advise only attempting the wordlist attack on less-       │
+    │    We advise only attempting the wordlist attack on less-            │
     │    capable systems. However, this main program does automatically    │
     │    parse through pcap data and preformat it into .22000 and .john    │
     │    formats for condensed data storage.                               │
@@ -1672,8 +1806,10 @@ if __name__ == "__main__":
             )
         
         elif mode_type == "map":
-            # Start GPS polling (gps3)
-            suite.start_gps_polling()
+            # Start GPS polling (gps3) - pass GPS device for error messages
+            if not suite.start_gps_polling(gps_device=args.gps_port):
+                suite.log("Cannot proceed without gpsd. Please start gpsd and try again.", prefix="x")
+                sys.exit(1)
             # Ensure interface is configured
             suite.configure_interface()
             # Start signal mapping
