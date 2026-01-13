@@ -15,14 +15,18 @@ cd MiFi
 ```
 
 The setup script will:
-- Create all necessary directories
+- Create all necessary directories (logs, collection, archive, tracking, john, hc, tak, config)
+- Create database file (`config/networks.db`)
 - Install all system dependencies (aircrack-ng, john, hashcat, gpsd, etc.)
-- Install Python dependencies
-- Download rockyou.txt wordlist
+- Install Python dependencies from `config/requirements.txt`
+- Download `config/rockyou.txt` wordlist
+- Create default `config/config.ini` configuration file
 - Configure GPS services
 - Verify installation
 
 **Note:** The script will prompt for sudo when needed for system package installation.
+
+**Git Repository:** This repository tracks only source code and documentation. Runtime files (databases, captured handshakes, certificates, etc.) are excluded via `.gitignore` and will be created automatically by `start.sh`.
 
 ### Manual Setup
 
@@ -35,6 +39,7 @@ If you prefer manual installation, see the [Manual Installation](#manual-install
 - **WiFi Handshake Collection**: Automated WPA2 handshake capture with deauth attacks
 - **Signal Mapping with GPS**: Real-time WiFi signal strength mapping with GPS coordinates
 - **Web Dashboard**: Interactive map visualization with filtering, color coding, and analysis tools
+- **TAK Server Integration**: Native CoT message support for TAK Server 5.6 (no plugin required)
 - **Hash Processing**: Automatic conversion to Hashcat (.22000) and John the Ripper (.john) formats
 - **Wordlist Cracking**: Integrated aircrack-ng wordlist attacks
 - **Helper Scripts**: Automated cracking workflows for Hashcat and John the Ripper
@@ -153,7 +158,7 @@ python3 mifi.py --mode process-manual
 - Archives processed files automatically
 
 **Options:**
-- `-WL, --word-list <path>`: Custom wordlist path (default: rockyou.txt)
+- `-WL, --word-list <path>`: Custom wordlist path (default: config/rockyou.txt)
 
 **Example:**
 ```bash
@@ -203,6 +208,7 @@ sudo python3 mifi.py --mode map
 **Features:**
 - Scans for networks at multiple GPS locations
 - Records signal strength with GPS coordinates
+- **TAK Server Integration**: Sends CoT messages to TAK Server 5.6 (use `-tak` flag or enable in `config/config.ini`)
 - Stores data in database for dashboard visualization
 - Waits for new GPS fixes between scans
 
@@ -236,7 +242,7 @@ sudo python3 mifi.py --mode config
 **Features:**
 - Detects available wireless interfaces
 - Enables monitor mode automatically
-- Saves interface to config.ini
+- Saves interface to config/config.ini
 - Required before using `-H` headless mode
 
 ### Dashboard Mode (`dashboard`)
@@ -278,7 +284,7 @@ python3 mifi.py --mode dashboard
 
 ### Process Mode Options
 
-- `-WL, --word-list <path>`: Custom wordlist path (default: rockyou.txt)
+- `-WL, --word-list <path>`: Custom wordlist path (default: config/rockyou.txt)
 
 ### Target Mode Options
 
@@ -292,6 +298,13 @@ python3 mifi.py --mode dashboard
 - `-MSD, --map-scan-duration <seconds>`: Scan duration (default: 1)
 - `-GPS, --gps-port <path>`: GPS device path (default: /dev/ttyUSB0)
 - `-GLA, --gps-lock-attempts <count>`: GPS fix attempts (default: 20)
+- `-tak`: Enable TAK Server integration (or configure in `config/config.ini`)
+- `--tak-host <host>`: TAK Server hostname/IP (overrides `config/config.ini`)
+- `--tak-port <port>`: TAK Server port (default: 8087)
+- `--tak-protocol <tcp|udp>`: Protocol (default: tcp)
+- `--tak-cert <path>`: Client certificate file
+- `--tak-key <path>`: Private key file
+- `--tak-ca <path>`: CA certificate file
 - `-GLW, --gps-lock-wait <seconds>`: Wait between attempts (default: 5)
 
 ---
@@ -303,37 +316,71 @@ MiFi/
 ├── mifi.py                 # Main CLI tool
 ├── mifi_dashboard.py       # Web dashboard server
 ├── start.sh                # Automated setup script
-├── requirements.txt        # Python dependencies
-├── config.ini              # Interface configuration (auto-created)
-├── networks.db             # SQLite database (auto-created)
-├── rockyou.txt             # Wordlist (downloaded by start.sh)
+├── README.md               # This file
 │
-├── logs/                   # Application logs
+├── config/                 # Configuration and data files
+│   ├── requirements.txt    # Python dependencies (tracked in git)
+│   ├── config.ini          # Interface configuration (auto-created, not in git)
+│   ├── networks.db         # SQLite database (auto-created, not in git)
+│   └── rockyou.txt        # Wordlist (downloaded by start.sh, not in git)
+│
+├── logs/                   # Application logs (not in git)
 │   └── YYYY-MM-DD_HH-MM-SS.log
 │
-├── collection/             # Captured handshakes (.cap files)
+├── collection/             # Captured handshakes (.cap files, not in git)
 │   └── ESSID--BSSID--CH--TIMESTAMP-01.cap
 │
-├── archive/                # Processed files archive
+├── archive/                # Processed files archive (not in git)
 │   └── pcap/               # Archived .cap files
 │
-├── tracking/               # Exported tracking data
+├── tracking/               # Exported tracking data (not in git, created by start.sh)
 │   ├── tracking_data_*.json
 │   └── tracking_data_*.csv
 │
 ├── john/                   # John the Ripper processing
-│   ├── jtr.py              # John automation script
-│   ├── *.john              # WPA handshake hashes
-│   ├── *_eapol.john        # EAPOL-specific hashes
-│   ├── *_pmkid.john        # PMKID-specific hashes
-│   ├── results/            # Cracked password outputs
-│   └── archive/            # Processed file archive
+│   ├── jtr.py              # John automation script (tracked in git)
+│   ├── *.john              # WPA handshake hashes (not in git)
+│   ├── *_eapol.john        # EAPOL-specific hashes (not in git)
+│   ├── *_pmkid.john        # PMKID-specific hashes (not in git)
+│   ├── results/            # Cracked password outputs (not in git)
+│   └── archive/            # Processed file archive (not in git)
 │
-└── hc/                     # Hashcat processing
-    ├── hash_cat.py         # Hashcat automation script
-    ├── *.22000             # Hashcat format hashes
-    └── archive/            # Processed file archive
+├── hc/                     # Hashcat processing
+│   ├── hash_cat.py         # Hashcat automation script (tracked in git)
+│   ├── *.22000             # Hashcat format hashes (not in git)
+│   └── archive/            # Processed file archive (not in git)
+│
+└── tak/                    # TAK Server integration
+    ├── nginx_tak_stream.conf  # Nginx config (tracked in git)
+    ├── TAK_SERVER_SETUP.md    # Setup documentation (tracked in git)
+    ├── *.p12, *.pem        # Certificates (not in git - user-specific)
+    └── *.crt, *.key        # Additional certs (not in git)
 ```
+
+### Files Tracked in Git
+
+The repository tracks only source code and documentation:
+- Python scripts: `mifi.py`, `mifi_dashboard.py`
+- Helper scripts: `hc/hash_cat.py`, `john/jtr.py`
+- Configuration template: `config/requirements.txt`
+- Documentation: `README.md`, `tak/TAK_SERVER_SETUP.md`
+- Setup script: `start.sh`
+- Nginx config: `tak/nginx_tak_stream.conf`
+
+### Files NOT Tracked in Git
+
+Runtime files and user-specific data are excluded:
+- `__pycache__/` - Python cache files
+- `collection/` - Captured handshake files (.cap)
+- `*.john` - John the Ripper hash files
+- `config/networks.db` - SQLite database
+- `config/config.ini` - User configuration
+- `config/rockyou.txt` - Wordlist (large file)
+- `config/.mifi_dashboard_state.json` - Dashboard state
+- `tak/*.pem`, `tak/*.p12` - TAK certificates (user-specific)
+- `logs/`, `archive/`, `tracking/` - Runtime directories
+
+All excluded files are automatically created by `start.sh` when setting up the environment.
 
 ---
 
@@ -376,29 +423,31 @@ sudo pacman -S aircrack-ng john hashcat python python-pip gpsd iw wireless_tools
 #### 2. Install Python Dependencies
 
 ```bash
-pip3 install --user -r requirements.txt
+pip3 install --user -r config/requirements.txt
 ```
 
 Or system-wide:
 ```bash
-sudo pip3 install -r requirements.txt
+sudo pip3 install -r config/requirements.txt
 ```
 
 #### 3. Download Wordlist
 
 ```bash
 # Option 1: Download from GitHub
-wget https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt
+wget https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt -O config/rockyou.txt
 
 # Option 2: Extract from system location
-gunzip -c /usr/share/wordlists/rockyou.txt.gz > rockyou.txt
+gunzip -c /usr/share/wordlists/rockyou.txt.gz > config/rockyou.txt
 ```
 
 #### 4. Create Directories
 
 ```bash
-mkdir -p logs collection archive/pcap tracking john/results john/archive hc/archive
+mkdir -p logs collection archive/pcap tracking john/results john/archive hc/archive tak config
 ```
+
+**Note:** The `tracking/` folder is required for exporting tracking data. It is automatically created by `start.sh`.
 
 #### 5. Configure GPS (Optional)
 
@@ -510,7 +559,7 @@ python3 jtr.py
 ```
 
 **Features:**
-- Finds all `.john` files
+- Finds all `.john` files (not tracked in git)
 - Runs dictionary and brute-force attacks
 - Outputs results to `results/` directory
 - Archives processed files
@@ -525,8 +574,8 @@ python3 hash_cat.py
 ```
 
 **Features:**
-- Finds `.22000` files
-- Downloads rockyou.txt if missing
+- Finds `.22000` files (not tracked in git)
+- Downloads config/rockyou.txt if missing
 - Runs multiple attack modes
 - Archives processed files
 
@@ -539,7 +588,7 @@ python3 hash_cat.py
 #### Database Permissions
 If you run `mifi` with `sudo`, the database may be owned by root:
 ```bash
-sudo chown $USER:$USER networks.db
+sudo chown $USER:$USER config/networks.db
 ```
 
 #### GPS Not Detected
@@ -557,7 +606,7 @@ sudo chown $USER:$USER networks.db
 
 #### No Data in Dashboard
 1. Ensure you've run map mode at least once
-2. Check database exists and has data: `sqlite3 networks.db "SELECT COUNT(*) FROM signal_tracking;"`
+2. Check database exists and has data: `sqlite3 config/networks.db "SELECT COUNT(*) FROM signal_tracking;"`
 3. Verify database permissions
 
 #### Missing Dependencies
@@ -570,7 +619,7 @@ Or manually install missing packages based on error messages.
 
 #### Interface Not Found
 1. Run config mode: `sudo python3 mifi.py --mode config`
-2. Manually edit `config.ini` with your interface name
+2. Manually edit `config/config.ini` with your interface name
 3. Ensure interface is in monitor mode
 
 ---
@@ -598,13 +647,14 @@ Or manually install missing packages based on error messages.
 - `iw` and `wireless-tools`
 
 ### Python Packages
-- `tabulate>=0.8.9`
+- `tabulate>=0.9.0`
 - `pyserial>=3.5`
 - `gps3>=0.33.3`
 - `flask>=2.0.0`
+- `flask-cors>=4.0.0`
 
 ### Files
-- `rockyou.txt` wordlist (auto-downloaded by start.sh)
+- `config/rockyou.txt` wordlist (auto-downloaded by start.sh)
 
 ---
 

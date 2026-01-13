@@ -51,7 +51,7 @@ def find_file(file_name, url):
 def main():
     potfile_path = "hashcat.potfile"
     archive_dir = "archive"
-    text_file = "rockyou.txt"
+    text_file = "config/rockyou.txt"
     text_url = "https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt"
 
     # Ensure the archive directory exists

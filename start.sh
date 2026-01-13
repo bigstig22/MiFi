@@ -58,7 +58,7 @@ check_root() {
 create_directories() {
     print_status "Creating necessary directories..."
     
-    DIRS=("logs" "collection" "archive/pcap" "tracking" "john/results" "john/archive" "hc/archive")
+    DIRS=("logs" "collection" "archive/pcap" "tracking" "john/results" "john/archive" "hc/archive" "tak" "config")
     
     for dir in "${DIRS[@]}"; do
         if [ ! -d "$dir" ]; then
@@ -68,6 +68,20 @@ create_directories() {
             print_info "Directory already exists: $dir"
         fi
     done
+}
+
+# Function to create database file
+create_database() {
+    print_status "Creating database file..."
+    
+    DB_FILE="config/networks.db"
+    
+    if [ ! -f "$DB_FILE" ]; then
+        touch "$DB_FILE"
+        print_info "Created database file: $DB_FILE"
+    else
+        print_info "Database file already exists: $DB_FILE"
+    fi
 }
 
 # Function to detect Linux distribution
@@ -176,6 +190,235 @@ install_system_packages() {
     return 0
 }
 
+# Function to install John the Ripper Jumbo (includes wpapcap2john)
+install_john_jumbo() {
+    print_status "Checking for John the Ripper Jumbo (required for wpapcap2john)..."
+    
+    # First, ensure PATH includes common installation locations
+    export PATH="$PATH:/usr/local/bin:/usr/local/sbin"
+    
+    # Check if wpapcap2john is already in PATH
+    if command_exists wpapcap2john; then
+        print_info "wpapcap2john is already available in PATH: $(which wpapcap2john)"
+        return 0
+    fi
+    
+    # Check common installation locations
+    WPA2JOHN_LOCATIONS=(
+        "/usr/local/bin/wpapcap2john"
+        "/usr/local/sbin/wpapcap2john"
+        "/usr/bin/wpapcap2john"
+        "/usr/sbin/wpapcap2john"
+        "$HOME/.local/bin/wpapcap2john"
+    )
+    
+    for location in "${WPA2JOHN_LOCATIONS[@]}"; do
+        if [ -f "$location" ] && [ -x "$location" ]; then
+            print_info "wpapcap2john found at: $location"
+            # Add parent directory to PATH if not already there
+            PARENT_DIR=$(dirname "$location")
+            if [[ ":$PATH:" != *":$PARENT_DIR:"* ]]; then
+                PATH_LINE="export PATH=\"\$PATH:$PARENT_DIR\""
+                if ! grep -q "$PARENT_DIR" ~/.bashrc 2>/dev/null; then
+                    echo "$PATH_LINE" >> ~/.bashrc
+                    print_info "Added $PARENT_DIR to PATH in ~/.bashrc"
+                fi
+                export PATH="$PATH:$PARENT_DIR"
+            fi
+            if command_exists wpapcap2john; then
+                print_status "wpapcap2john is now available"
+                return 0
+            fi
+        fi
+    done
+    
+    # Check if there's an existing build we can use
+    EXISTING_BUILDS=(
+        "/tmp/john-jumbo/run/wpapcap2john"
+        "$HOME/john-jumbo/run/wpapcap2john"
+    )
+    
+    for build_path in "${EXISTING_BUILDS[@]}"; do
+        if [ -f "$build_path" ] && [ -x "$build_path" ]; then
+            print_info "Found existing wpapcap2john build at: $build_path"
+            print_info "Installing to /usr/local/bin..."
+            if sudo cp "$build_path" /usr/local/bin/ && sudo chmod +x /usr/local/bin/wpapcap2john; then
+                export PATH="$PATH:/usr/local/bin"
+                if command_exists wpapcap2john; then
+                    print_status "wpapcap2john installed and available"
+                    # Add to PATH in shell profile
+                    if ! grep -q "/usr/local/bin" ~/.bashrc 2>/dev/null; then
+                        echo 'export PATH="$PATH:/usr/local/bin:/usr/local/sbin"' >> ~/.bashrc
+                        print_info "Added /usr/local/bin to PATH in ~/.bashrc"
+                    fi
+                    return 0
+                fi
+            else
+                print_warning "Failed to install from existing build, will compile fresh"
+            fi
+        fi
+    done
+    
+    # If we get here, wpapcap2john is not installed - proceed with installation
+    print_info "wpapcap2john not found - proceeding with installation..."
+    
+    # Check for build dependencies
+    print_info "Checking build dependencies..."
+    MISSING_DEPS=()
+    if ! command_exists gcc; then
+        MISSING_DEPS+=("gcc")
+    fi
+    if ! command_exists make; then
+        MISSING_DEPS+=("make")
+    fi
+    if ! command_exists git; then
+        MISSING_DEPS+=("git")
+    fi
+    
+    if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
+        print_info "Installing build dependencies: ${MISSING_DEPS[*]}"
+        detect_distro
+        case $DISTRO in
+            ubuntu|debian)
+                sudo apt-get install -y "${MISSING_DEPS[@]}" build-essential || {
+                    print_error "Failed to install build dependencies"
+                    return 1
+                }
+                ;;
+            fedora|rhel|centos)
+                sudo dnf install -y "${MISSING_DEPS[@]}" gcc make || {
+                    print_error "Failed to install build dependencies"
+                    return 1
+                }
+                ;;
+            arch|manjaro)
+                sudo pacman -S --noconfirm "${MISSING_DEPS[@]}" base-devel || {
+                    print_error "Failed to install build dependencies"
+                    return 1
+                }
+                ;;
+            *)
+                print_warning "Please manually install: ${MISSING_DEPS[*]}"
+                return 1
+                ;;
+        esac
+    fi
+    
+    # Create temporary directory for build
+    BUILD_DIR="/tmp/john-jumbo-build-$$"
+    mkdir -p "$BUILD_DIR"
+    cd "$BUILD_DIR"
+    
+    print_info "Cloning John the Ripper Jumbo repository..."
+    if ! git clone https://github.com/openwall/john -b bleeding-jumbo john-jumbo 2>/dev/null; then
+        print_error "Failed to clone John the Ripper Jumbo repository"
+        cd "$SCRIPT_DIR"
+        rm -rf "$BUILD_DIR"
+        return 1
+    fi
+    
+    cd john-jumbo/src
+    
+    print_info "Configuring build..."
+    if ! ./configure >/dev/null 2>&1; then
+        print_error "Failed to configure John the Ripper Jumbo"
+        cd "$SCRIPT_DIR"
+        rm -rf "$BUILD_DIR"
+        return 1
+    fi
+    
+    print_info "Compiling John the Ripper Jumbo (this may take a few minutes)..."
+    CPU_COUNT=$(nproc 2>/dev/null || echo "4")
+    if ! make -s clean && make -sj$CPU_COUNT >/dev/null 2>&1; then
+        print_error "Failed to compile John the Ripper Jumbo"
+        cd "$SCRIPT_DIR"
+        rm -rf "$BUILD_DIR"
+        return 1
+    fi
+    
+    print_info "Installing John the Ripper Jumbo..."
+    # Try make install, but also manually copy wpapcap2john if needed
+    if ! sudo make install >/dev/null 2>&1; then
+        print_warning "make install had issues, manually installing wpapcap2john..."
+    fi
+    
+    # Ensure wpapcap2john is installed (make install might not include it)
+    if [ -f "../run/wpapcap2john" ]; then
+        print_info "Copying wpapcap2john to /usr/local/bin..."
+        if sudo cp "../run/wpapcap2john" /usr/local/bin/ && sudo chmod +x /usr/local/bin/wpapcap2john; then
+            print_info "wpapcap2john installed to /usr/local/bin"
+        else
+            print_error "Failed to copy wpapcap2john to /usr/local/bin"
+            cd "$SCRIPT_DIR"
+            rm -rf "$BUILD_DIR" 2>/dev/null || sudo rm -rf "$BUILD_DIR" 2>/dev/null || true
+            return 1
+        fi
+    else
+        print_error "wpapcap2john not found in build directory"
+        cd "$SCRIPT_DIR"
+        rm -rf "$BUILD_DIR" 2>/dev/null || sudo rm -rf "$BUILD_DIR" 2>/dev/null || true
+        return 1
+    fi
+    
+    # Clean up build directory (use sudo if needed for files created during install)
+    cd "$SCRIPT_DIR"
+    if [ -d "$BUILD_DIR" ]; then
+        rm -rf "$BUILD_DIR" 2>/dev/null || sudo rm -rf "$BUILD_DIR" 2>/dev/null || {
+            print_warning "Could not fully clean build directory: $BUILD_DIR"
+            print_info "You can manually remove it later if needed"
+        }
+    fi
+    
+    # Add to PATH in shell profile if not already there
+    PATH_LINE='export PATH="$PATH:/usr/local/bin:/usr/local/sbin"'
+    if ! grep -q "/usr/local/bin" ~/.bashrc 2>/dev/null; then
+        echo "$PATH_LINE" >> ~/.bashrc
+        print_info "Added /usr/local/bin to PATH in ~/.bashrc"
+    fi
+    
+    # Also add to .profile for non-interactive shells
+    if [ -f ~/.profile ] && ! grep -q "/usr/local/bin" ~/.profile 2>/dev/null; then
+        echo "$PATH_LINE" >> ~/.profile
+        print_info "Added /usr/local/bin to PATH in ~/.profile"
+    fi
+    
+    # Export for current session
+    export PATH="$PATH:/usr/local/bin:/usr/local/sbin"
+    
+    # Verify installation - check multiple locations
+    if command_exists wpapcap2john; then
+        print_status "John the Ripper Jumbo installed successfully!"
+        print_info "wpapcap2john is now available in PATH: $(which wpapcap2john)"
+        return 0
+    elif [ -f "/usr/local/bin/wpapcap2john" ]; then
+        print_status "John the Ripper Jumbo installed successfully!"
+        print_info "wpapcap2john found at /usr/local/bin/wpapcap2john"
+        print_info "PATH updated - run 'source ~/.bashrc' or restart terminal to use it"
+        return 0
+    elif [ -f "/usr/local/sbin/wpapcap2john" ]; then
+        print_status "John the Ripper Jumbo installed successfully!"
+        print_info "wpapcap2john found at /usr/local/sbin/wpapcap2john"
+        print_info "PATH updated - run 'source ~/.bashrc' or restart terminal to use it"
+        return 0
+    else
+        print_warning "wpapcap2john installed but not found in expected locations"
+        print_info "Checking for wpapcap2john in build directory..."
+        if [ -f "$BUILD_DIR/john-jumbo/run/wpapcap2john" ]; then
+            print_info "Found wpapcap2john in build directory, copying to /usr/local/bin..."
+            sudo cp "$BUILD_DIR/john-jumbo/run/wpapcap2john" /usr/local/bin/ && \
+            sudo chmod +x /usr/local/bin/wpapcap2john && {
+                export PATH="$PATH:/usr/local/bin"
+                if command_exists wpapcap2john; then
+                    print_status "wpapcap2john is now available"
+                    return 0
+                fi
+            }
+        fi
+        print_warning "You may need to restart your terminal or run: source ~/.bashrc"
+        return 1
+    fi
+}
+
 # Function to install Python packages
 install_python_packages() {
     print_status "Installing Python dependencies..."
@@ -219,8 +462,8 @@ install_python_packages() {
         print_warning "Failed to upgrade pip, continuing anyway..."
     }
     
-    print_info "Installing Python packages from requirements.txt..."
-    python3 -m pip install --user -r requirements.txt || {
+    print_info "Installing Python packages from config/requirements.txt..."
+    python3 -m pip install --user -r config/requirements.txt || {
         print_error "Failed to install Python packages"
         return 1
     }
@@ -233,8 +476,8 @@ install_python_packages() {
 download_rockyou() {
     print_status "Checking for rockyou.txt wordlist..."
     
-    if [ -f "rockyou.txt" ]; then
-        print_info "rockyou.txt already exists"
+    if [ -f "config/rockyou.txt" ]; then
+        print_info "config/rockyou.txt already exists"
         return 0
     fi
     
@@ -248,10 +491,10 @@ download_rockyou() {
     
     for url in "${ROCKYOU_URLS[@]}"; do
         print_info "Trying: $url"
-        if wget -q --show-progress -O rockyou.txt "$url" 2>/dev/null || \
-           curl -L -o rockyou.txt "$url" 2>/dev/null; then
-            if [ -f "rockyou.txt" ] && [ -s "rockyou.txt" ]; then
-                print_status "Successfully downloaded rockyou.txt"
+        if wget -q --show-progress -O config/rockyou.txt "$url" 2>/dev/null || \
+           curl -L -o config/rockyou.txt "$url" 2>/dev/null; then
+            if [ -f "config/rockyou.txt" ] && [ -s "config/rockyou.txt" ]; then
+                print_status "Successfully downloaded config/rockyou.txt"
                 return 0
             fi
         fi
@@ -265,7 +508,7 @@ download_rockyou() {
     # Try to extract from system location
     if [ -f "/usr/share/wordlists/rockyou.txt.gz" ]; then
         print_info "Found system rockyou.txt.gz, extracting..."
-        gunzip -c /usr/share/wordlists/rockyou.txt.gz > rockyou.txt 2>/dev/null && {
+        gunzip -c /usr/share/wordlists/rockyou.txt.gz > config/rockyou.txt 2>/dev/null && {
             print_status "Extracted rockyou.txt from system location"
             return 0
         }
@@ -309,18 +552,147 @@ setup_gps() {
 create_config() {
     print_status "Checking configuration file..."
     
-    if [ ! -f "config.ini" ]; then
-        print_info "Creating default config.ini..."
-        cat > config.ini << 'EOF'
+    if [ ! -f "config/config.ini" ]; then
+        print_info "Creating default config/config.ini..."
+        cat > config/config.ini << 'EOF'
 [DEFAULT]
 # Monitor mode interface candidates (comma-separated)
 # The tool will automatically detect and use these interfaces
 monitor_candidates = wlan1,wlp0s20f0u2
+
+[TAK]
+# TAK Server Configuration
+# Set enabled = true to enable TAK integration
+# Certificate files should be placed in the 'tak' folder
+# Paths in config.ini are relative to the 'tak' folder (or use absolute paths)
+enabled = false
+host = 
+port = 8087
+protocol = tcp
+# Certificate-based authentication (leave empty if not using)
+# Files should be in the 'tak' folder, e.g., 'webadmin.p12' or 'tak/webadmin.p12'
+cert_file = 
+key_file = 
+ca_file = 
+# API token authentication (alternative to certificates, leave empty if not using)
+api_token = 
 EOF
-        print_status "Created default config.ini"
+        print_status "Created default config/config.ini"
     else
-        print_info "config.ini already exists"
+        print_info "config/config.ini already exists"
     fi
+}
+
+# Function to setup TAK configuration
+setup_tak_config() {
+    print_status "TAK Server Configuration (optional)..."
+    
+    if [ ! -f "config/config.ini" ]; then
+        print_warning "config/config.ini not found, skipping TAK configuration"
+        return 0
+    fi
+    
+    read -p "Do you want to configure TAK Server integration? (y/n): " configure_tak
+    if [[ ! "$configure_tak" =~ ^[Yy]$ ]]; then
+        print_info "Skipping TAK configuration"
+        return 0
+    fi
+    
+    # Read current config
+    TAK_ENABLED=$(grep -E "^enabled\s*=" config/config.ini | grep -i "\[TAK\]" -A 10 | grep "^enabled" | cut -d'=' -f2 | tr -d ' ' || echo "false")
+    
+    # Enable TAK
+    print_info "Enabling TAK integration..."
+    sed -i '/^\[TAK\]/,/^\[/ s/^enabled = .*/enabled = true/' config/config.ini || \
+    sed -i '/^\[TAK\]/a enabled = true' config/config.ini
+    
+    # Get TAK host
+    read -p "Enter TAK Server hostname or IP address: " tak_host
+    if [ -n "$tak_host" ]; then
+        sed -i '/^\[TAK\]/,/^\[/ s/^host = .*/host = '"$tak_host"'/' config.ini || \
+        sed -i '/^\[TAK\]/a host = '"$tak_host"'' config.ini
+    fi
+    
+    # Get TAK port
+    read -p "Enter TAK Server Streaming port [8087]: " tak_port
+    tak_port=${tak_port:-8087}
+    sed -i '/^\[TAK\]/,/^\[/ s/^port = .*/port = '"$tak_port"'/' config.ini || \
+    sed -i '/^\[TAK\]/a port = '"$tak_port"'' config.ini
+    
+    # Get protocol
+    read -p "Enter protocol (tcp/udp) [tcp]: " tak_protocol
+    tak_protocol=${tak_protocol:-tcp}
+    sed -i '/^\[TAK\]/,/^\[/ s/^protocol = .*/protocol = '"$tak_protocol"'/' config.ini || \
+    sed -i '/^\[TAK\]/a protocol = '"$tak_protocol"'' config.ini
+    
+    # Ask about authentication
+    print_info "Certificate files should be placed in the 'tak' folder"
+    read -p "Use certificate authentication? (y/n) [n]: " use_certs
+    if [[ "$use_certs" =~ ^[Yy]$ ]]; then
+        echo ""
+        print_info "CERT_FILE: Client certificate file"
+        print_info "  Required extensions: .p12, .pfx (PKCS#12 - contains both cert and key)"
+        print_info "  OR separate files: .crt, .pem, .cer (PEM format certificate)"
+        print_info "  Examples: webadmin.p12, client.crt, certificate.pem"
+        read -p "Enter cert_file filename (will be placed in 'tak' folder) or full path: " cert_file
+        if [ -n "$cert_file" ]; then
+            # If it's not an absolute path, assume it's a filename for the tak folder
+            if [[ "$cert_file" != /* ]]; then
+                cert_path="tak/$cert_file"
+                print_info "Certificate will be expected at: $cert_path"
+            else
+                cert_path="$cert_file"
+            fi
+            sed -i '/^\[TAK\]/,/^\[/ s|^cert_file = .*|cert_file = '"$cert_file"'|' config/config.ini || \
+            sed -i '/^\[TAK\]/a cert_file = '"$cert_file"'' config/config.ini
+        fi
+        
+        echo ""
+        print_info "KEY_FILE: Private key file (only needed if cert_file is NOT .p12/.pfx)"
+        print_info "  Required extensions: .key, .pem (PEM format private key)"
+        print_info "  Note: If cert_file is .p12/.pfx, this can be left empty (key is in cert file)"
+        print_info "  Examples: client.key, private.pem"
+        read -p "Enter key_file filename (optional if using .p12/.pfx, will be placed in 'tak' folder) or full path: " key_file
+        if [ -n "$key_file" ]; then
+            if [[ "$key_file" != /* ]]; then
+                key_path="tak/$key_file"
+                print_info "Private key will be expected at: $key_path"
+            else
+                key_path="$key_file"
+            fi
+            sed -i '/^\[TAK\]/,/^\[/ s|^key_file = .*|key_file = '"$key_file"'|' config/config.ini || \
+            sed -i '/^\[TAK\]/a key_file = '"$key_file"'' config/config.ini
+        fi
+        
+        echo ""
+        print_info "CA_FILE: CA (Certificate Authority) certificate file (optional)"
+        print_info "  Required extensions: .crt, .pem, .cer, .ca (PEM format CA certificate)"
+        print_info "  Used to verify the TAK server's certificate"
+        print_info "  Examples: ca.crt, root.pem, ca-certificate.cer"
+        read -p "Enter ca_file filename (optional, will be placed in 'tak' folder) or full path: " ca_file
+        if [ -n "$ca_file" ]; then
+            if [[ "$ca_file" != /* ]]; then
+                ca_path="tak/$ca_file"
+                print_info "CA certificate will be expected at: $ca_path"
+            else
+                ca_path="$ca_file"
+            fi
+            sed -i '/^\[TAK\]/,/^\[/ s|^ca_file = .*|ca_file = '"$ca_file"'|' config/config.ini || \
+            sed -i '/^\[TAK\]/a ca_file = '"$ca_file"'' config/config.ini
+        fi
+    else
+        read -p "Use API token authentication? (y/n) [n]: " use_token
+        if [[ "$use_token" =~ ^[Yy]$ ]]; then
+            read -p "Enter API token: " api_token
+            if [ -n "$api_token" ]; then
+                sed -i '/^\[TAK\]/,/^\[/ s|^api_token = .*|api_token = '"$api_token"'|' config/config.ini || \
+                sed -i '/^\[TAK\]/a api_token = '"$api_token"'' config/config.ini
+            fi
+        fi
+    fi
+    
+    print_status "TAK configuration saved to config/config.ini"
+    print_info "You can edit config/config.ini manually to change TAK settings later"
 }
 
 # Function to check WiFi interface
@@ -366,15 +738,32 @@ verify_installation() {
         fi
     done
     
+    # Check for wpapcap2john (from John the Ripper Jumbo)
+    print_info "Checking wpapcap2john..."
+    if ! command_exists wpapcap2john; then
+        print_error "wpapcap2john not found in PATH (required for WPA handshake analysis)"
+        print_info "This tool is part of John the Ripper Jumbo"
+        print_info "Run './start.sh' again to install it, or install manually"
+        ((VERIFY_ERRORS++))
+    else
+        print_info "wpapcap2john is available"
+    fi
+    
     # Check directories
     print_info "Checking directories..."
-    DIRS=("logs" "collection" "archive" "tracking" "john" "hc")
+    DIRS=("logs" "collection" "archive" "tracking" "john" "hc" "config")
     for dir in "${DIRS[@]}"; do
         if [ ! -d "$dir" ]; then
             print_error "Directory missing: $dir"
             ((VERIFY_ERRORS++))
         fi
     done
+    
+    # Check database file
+    if [ ! -f "config/networks.db" ]; then
+        print_error "Database file missing: config/networks.db"
+        ((VERIFY_ERRORS++))
+    fi
     
     if [ $VERIFY_ERRORS -eq 0 ]; then
         print_status "Installation verification passed!"
@@ -401,31 +790,43 @@ main() {
     create_directories || print_error "Failed to create directories"
     echo ""
     
-    # Step 2: Install system packages
+    # Step 2: Create database file
+    create_database || print_error "Failed to create database file"
+    echo ""
+    
+    # Step 3: Install system packages
     install_system_packages || print_error "Failed to install system packages"
     echo ""
     
-    # Step 3: Install Python packages
+    # Step 4: Install John the Ripper Jumbo (for wpapcap2john)
+    install_john_jumbo || print_warning "John the Ripper Jumbo installation had issues (wpapcap2john may not be available)"
+    echo ""
+    
+    # Step 5: Install Python packages
     install_python_packages || print_error "Failed to install Python packages"
     echo ""
     
-    # Step 4: Download rockyou.txt
+    # Step 6: Download rockyou.txt
     download_rockyou || print_warning "rockyou.txt not available (optional)"
     echo ""
     
-    # Step 5: Setup GPS
+    # Step 7: Setup GPS
     setup_gps || print_warning "GPS setup incomplete (optional)"
     echo ""
     
-    # Step 6: Create config
+    # Step 8: Create config
     create_config
     echo ""
     
-    # Step 7: Check WiFi interface
+    # Step 9: Setup TAK configuration (optional)
+    setup_tak_config
+    echo ""
+    
+    # Step 10: Check WiFi interface
     check_wifi_interface
     echo ""
     
-    # Step 8: Verify installation
+    # Step 11: Verify installation
     verify_installation
     echo ""
     
@@ -465,4 +866,3 @@ main() {
 
 # Run main function
 main
-

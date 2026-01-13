@@ -11,12 +11,28 @@ import shutil
 import argparse
 import re
 import sys
-import serial
+try:
+    import serial
+    # Verify it's pyserial, not the conflicting 'serial' package
+    if not hasattr(serial, 'Serial'):
+        raise ImportError("Wrong 'serial' module installed. Uninstall 'serial' and install 'pyserial'")
+except ImportError:
+    # Try importing pyserial explicitly
+    try:
+        import pyserial as serial
+    except ImportError:
+        serial = None
+        print("[!] WARNING: pyserial not available. GPS serial initialization will fail.")
 import json
 from datetime import datetime
 import threading
 from gps3 import gps3
 import copy
+import xml.etree.ElementTree as ET
+import socket
+import ssl
+import tempfile
+import getpass
 
 class wifi_cracker:
 
@@ -29,6 +45,7 @@ class wifi_cracker:
         self.target = None
         self.interface = None
         self.verbose = False
+        self.debug = False  # Debug mode for detailed debugging output
         self.packets = 100
         self.initial_scan = 30
         self.target_scan = 60
@@ -49,38 +66,105 @@ class wifi_cracker:
         self.tracked_channel = None
         self.initial_signal_strength = None
         self.initial_gps_position = None
+        
+        # TAK server variables (will be loaded from config/config.ini)
+        self.tak_enabled = False
+        self.tak_host = None
+        self.tak_port = 8087
+        self.tak_protocol = 'tcp'  # 'tcp' or 'udp'
+        self.tak_cert_file = None
+        self.tak_key_file = None
+        self.tak_ca_file = None
+        self.tak_api_token = None
+        self.tak_socket = None
+        self.tak_connected = False
+        self.tak_last_keepalive = None
+        self.tak_keepalive_interval = 30  # Send keepalive every 30 seconds
 
         self.networks = {} 
         self.table_data = []
         self.directories = ["john", "hc", "logs", "collection","archive", "tracking"]
-        self.db_file = "networks.db"
+        self.db_file = "config/networks.db"
         
 
         self.timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
         self.log_file = os.path.join("logs", f"{self.timestamp}.log")
-        os.makedirs("logs", exist_ok=True)
         
         self.latest_gps_position = None
         self.gps_position_last_updated = None
         self.gps_thread = None
         self.gps_thread_stop = threading.Event()
         self.gps_lock = threading.Lock()
+        self.gps_status = 'disabled'  # Initialize GPS status
+        
+        # Log callback for dashboard integration (optional)
+        self.log_callback = None
+    
+    def check_and_create_directories(self):
+        """
+        Checks for the existence of required directories created by start.sh.
+        Does not create directories - errors and directs user to start.sh if missing.
+        """
+        # Directories as defined in start.sh create_directories function
+        # These match exactly what start.sh creates
+        required_dirs = [
+            "logs",
+            "collection",
+            "archive/pcap",
+            "tracking",
+            "john/results",
+            "john/archive",
+            "hc/archive"
+        ]
+        
+        # Base directories that should exist (for verification)
+        base_dirs = ["archive", "john", "hc"]
+        
+        self.log("Checking system directory structure...", prefix="config")
+        
+        missing_dirs = []
+        
+        # Check base directories
+        for base_dir in base_dirs:
+            if not os.path.exists(base_dir):
+                missing_dirs.append(base_dir)
+                self.log(f"Base directory '{base_dir}' missing", indent=4, prefix="x")
+            else:
+                self.log(f"Base directory '{base_dir}' exists", indent=4, prefix="check")
+        
+        # Check all required directories (including subdirectories)
+        for dir_path in required_dirs:
+            if not os.path.exists(dir_path):
+                missing_dirs.append(dir_path)
+                self.log(f"Directory '{dir_path}' missing", indent=4, prefix="x")
+            else:
+                self.log(f"Directory '{dir_path}' exists", indent=4, prefix="check")
+        
+        # If any directories are missing, error and direct to start.sh
+        if missing_dirs:
+            self.log("", prefix="blank")
+            self.log("ERROR: Required directories are missing.", prefix="x")
+            self.log("Please run './start.sh' to set up the required directory structure.", indent=4, prefix="error")
+            self.log("MiFi does not create directories - this must be done via start.sh.", indent=4, prefix="error")
+            sys.exit(1)
     
     def initial_config(self):
         self.check_and_create_directories()
         self.init_database()
+        # Load TAK configuration from config/config.ini
+        self.load_tak_config()
 
     def configure_interface(self):
         """
         Ensures a monitor-mode interface is configured and available.
-        Uses base interface names from config.ini (e.g., wlan1, wlp0s20f0u9).
+        Uses base interface names from config/config.ini (e.g., wlan1, wlp0s20f0u9).
         Automatically detects if their monitor variant is active, or enables it.
         Prompts user only if none match.
         """
         self.log("Configuring interface...", prefix="config")
 
         config = configparser.ConfigParser()
-        config.read("config.ini")
+        config.read("config/config.ini")
 
         candidates = []
         if "DEFAULT" in config and "monitor_candidates" in config["DEFAULT"]:
@@ -155,7 +239,7 @@ class wifi_cracker:
             sys.exit(1)
         elif self.headless:
             self.log("No known interfaces nor existing interfaces in monitor mode. " \
-            "Please adjust config.ini or run '--mode config'",
+            "Please adjust config/config.ini or run '--mode config'",
             prefix="x"
             )
             sys.exit(1)
@@ -246,7 +330,7 @@ class wifi_cracker:
     def _is_monitor_mode(self, iface):
         """Checks if the given interface is in monitor mode."""
         try:
-            result = self.coms(['iwconfig', iface], capture_output=True)
+            result = self.coms(['iwconfig', iface], capture_output=True, suppress_stderr=True)
             return 'Mode:Monitor' in result.stdout  
         except subprocess.CalledProcessError:
             return False
@@ -264,9 +348,9 @@ class wifi_cracker:
         return None 
 
     def _update_config(self, new_iface):
-        """Adds a new monitor-mode interface to config.ini under monitor_candidates."""
+        """Adds a new monitor-mode interface to config/config.ini under monitor_candidates."""
         config = configparser.ConfigParser()
-        config.read("config.ini")
+        config.read("config/config.ini")
 
         # Ensure DEFAULT section exists
         if 'DEFAULT' not in config:
@@ -284,18 +368,108 @@ class wifi_cracker:
         config['DEFAULT']['monitor_candidates'] = ','.join(sorted(candidates))
 
         try:
-            with open("config.ini", "w") as f:
+            with open("config/config.ini", "w") as f:
                 config.write(f)
-            self.log(f"Updated config.ini: added '{new_iface}' to monitor candidates.", prefix="config")
+            self.log(f"Updated config/config.ini: added '{new_iface}' to monitor candidates.", prefix="config")
         except Exception as e:
-            self.log(f"Failed to update config.ini: {e}", prefix="x")
+            self.log(f"Failed to update config/config.ini: {e}", prefix="x")
 
+
+    def clean_mode(self):
+        """
+        Cleans all stored data: removes log files, clears/resets database, 
+        and clears interface configuration from config/config.ini.
+        """
+        self.log("Starting clean mode...", prefix="config")
+        
+        # Step 1: Remove all log files
+        self.log("Removing log files...", indent=4, prefix="dot")
+        log_count = 0
+        try:
+            if os.path.exists("logs"):
+                for log_file in glob.glob(os.path.join("logs", "*.log")):
+                    try:
+                        os.remove(log_file)
+                        log_count += 1
+                        if self.verbose:
+                            self.log(f"Removed: {os.path.basename(log_file)}", indent=8, prefix="dash")
+                    except OSError as e:
+                        self.log(f"Failed to remove {log_file}: {e}", indent=8, prefix="x")
+                self.log(f"Removed {log_count} log file(s)", indent=8, prefix="check")
+            else:
+                self.log("Logs directory does not exist", indent=8, prefix="dash")
+        except Exception as e:
+            self.log(f"Error removing log files: {e}", indent=8, prefix="x")
+        
+        # Step 2: Clear all data from database
+        self.log("Clearing database...", indent=4, prefix="dot")
+        try:
+            if os.path.exists(self.db_file):
+                conn = sqlite3.connect(self.db_file)
+                c = conn.cursor()
+                
+                # Delete all data from networks table
+                c.execute('DELETE FROM networks')
+                networks_deleted = c.rowcount
+                
+                # Delete all data from signal_tracking table
+                c.execute('DELETE FROM signal_tracking')
+                tracking_deleted = c.rowcount
+                
+                conn.commit()
+                conn.close()
+                
+                self.log(f"Cleared {networks_deleted} network record(s) and {tracking_deleted} tracking record(s)", indent=8, prefix="check")
+            else:
+                self.log(f"Database {self.db_file} does not exist", indent=8, prefix="dash")
+                # Create database if it doesn't exist
+                self.init_database()
+                self.log("Created database file", indent=8, prefix="check")
+        except sqlite3.OperationalError as e:
+            # If tables don't exist, create them
+            if "no such table" in str(e).lower():
+                self.log("Tables not found, creating database structure...", indent=8, prefix="dash")
+                self.init_database()
+                self.log("Created database structure", indent=8, prefix="check")
+            else:
+                self.log(f"Error clearing database: {e}", indent=8, prefix="x")
+        except Exception as e:
+            self.log(f"Error clearing database: {e}", indent=8, prefix="x")
+        
+        # Step 3: Clear interface configuration from config/config.ini
+        self.log("Clearing interface configuration...", indent=4, prefix="dot")
+        try:
+            config = configparser.ConfigParser()
+            if os.path.exists("config/config.ini"):
+                config.read("config/config.ini")
+            else:
+                config['DEFAULT'] = {}
+            
+            # Clear monitor_candidates
+            config['DEFAULT']['monitor_candidates'] = ''
+            
+            with open("config/config.ini", "w") as f:
+                config.write(f)
+            self.log("Cleared monitor_candidates from config/config.ini", indent=8, prefix="check")
+        except Exception as e:
+            self.log(f"Error clearing config/config.ini: {e}", indent=8, prefix="x")
+        
+        self.log("Clean mode complete", prefix="exited")
 
     def init_database(self):
         """
         Initializes the SQLite database by creating the 'networks' table 
         and 'signal_tracking' table if they don't already exist.
+        Requires the database file to exist (created by start.sh).
         """
+        # Check if database file exists (should be created by start.sh)
+        if not os.path.exists(self.db_file):
+            self.log("", prefix="blank")
+            self.log(f"ERROR: Database file '{self.db_file}' not found.", prefix="x")
+            self.log("Please run './start.sh' to create the database file.", indent=4, prefix="error")
+            self.log("MiFi does not create the database file - this must be done via start.sh.", indent=4, prefix="error")
+            sys.exit(1)
+        
         conn = sqlite3.connect(self.db_file)
         c = conn.cursor()
         
@@ -373,6 +547,26 @@ class wifi_cracker:
         conn.commit()
         conn.close()
 
+    def debug_print(self, msg, prefix='[DEBUG]', indent=0):
+        """
+        Print debug message only if debug mode is enabled.
+        This is for detailed debugging output that should not appear in normal operation.
+        """
+        if self.debug:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            indent_str = "    " * indent
+            prefix_str = f"{prefix} " if prefix else ""
+            final_msg = f"{timestamp} {indent_str}{prefix_str}{msg}"
+            print(final_msg, flush=True)
+            
+            # Also log to file if log_file is set
+            if hasattr(self, 'log_file') and self.log_file:
+                try:
+                    with open(self.log_file, "a", encoding="utf-8") as log:
+                        log.write(final_msg + "\n")
+                except Exception:
+                    pass  # Don't fail if logging fails
+    
     def log(self, msg, prefix='default', indent=0, tabulated=False):
         """
         Prints formatted log messages to the console with an optional 
@@ -410,6 +604,23 @@ class wifi_cracker:
                 log.write(final_msg + "\n")
         except Exception as e:
             print(f"[!] Logging to file failed: {e}")
+        
+        # Call log callback if set (for dashboard integration)
+        if self.log_callback:
+            try:
+                # Parse the log message for dashboard
+                from datetime import datetime
+                parsed = {
+                    'timestamp': timestamp,
+                    'message': clean_msg,
+                    'level': 'error' if prefix == 'error' or prefix == 'x' else ('success' if prefix == 'check' or prefix == 'plus' else 'info'),
+                    'prefix': prefix_str.strip(),
+                    'raw': final_msg
+                }
+                self.log_callback(parsed)
+            except Exception as e:
+                # Don't break logging if callback fails
+                pass
 
     def coms(self, command, verbose=None, background=False, preexec_fn=None,
             capture_output=False, check=False, text=True, suppress_stderr=False,
@@ -522,8 +733,16 @@ class wifi_cracker:
                             self.log(clean, prefix="blank")
                 except KeyboardInterrupt:
                     self.log("Interrupted. Terminating subprocess group...", prefix="dash")
-                    os.killpg(proc.pid, signal.SIGTERM)
-                    proc.wait()
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                        proc.wait(timeout=2)
+                    except (subprocess.TimeoutExpired, ProcessLookupError):
+                        try:
+                            proc.kill()
+                            proc.wait(timeout=1)
+                        except:
+                            pass
+                    raise  # Re-raise KeyboardInterrupt to stop the main program
                 except Exception as e:
                     self.log(f"Error reading process output: {e}", prefix="error")
 
@@ -563,7 +782,7 @@ class wifi_cracker:
             "Timestamp": timestamp
         }
 
-    def check_and_create_directories(self):
+    def check_directories(self):
         """
         Checks for the existence of required directories and the SQLite 
         database. Creates them if they do not exist.
@@ -572,18 +791,31 @@ class wifi_cracker:
 
         for directory_path in self.directories:
             if not os.path.exists(directory_path):
-                self.log(f"Directory '{directory_path}' does not exist. Creating it now.", indent=4, prefix="error")
-                os.makedirs(directory_path)
+                self.log(f"Directory '{directory_path}' does not exist. Run start.sh", indent=4, prefix="x")
+                sys.exit(1)
+                #os.makedirs(directory_path)
             else:
                 self.log(f"Directory '{directory_path}' already exists.", indent=4, prefix="check")
 
-        # Check for SQLite database
-        self.db_file = "networks.db"
+        # Step 1: Check if database file exists
         if not os.path.exists(self.db_file):
-            self.log(f"Database '{self.db_file}' does not exist. Initializing it now.", indent=4, prefix="error")
+            self.log(f"Database '{self.db_file}' does not exist. Run start.sh", indent=4, prefix="x")
+            sys.exit(1)
+
+        self.log(f"Database '{self.db_file}' already exists.", indent=4, prefix="check")
+
+        # Step 2: Check if 'networks' table exists
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='networks';")
+        result = c.fetchone()
+
+        if result is None:
+            self.log("Table 'networks' does not exist, creating now...", indent=8, prefix="error")
             self.init_database()
-        else:
-            self.log(f"Database '{self.db_file}' already exists.", indent=4, prefix="check")
+
+        conn.close()
 
     def scan_networks(self, timeout=None):
         """
@@ -591,7 +823,7 @@ class wifi_cracker:
         Accepts a timeout parameter to control scan duration.
         """
         if not self.target_essid:
-            self.log("Initializing scan...", prefix="moved")
+            self.log("Scanning for networks...", prefix="moved", indent=4)
         scan_timeout = timeout if timeout is not None else self.initial_scan
 
         try:
@@ -599,8 +831,37 @@ class wifi_cracker:
                 self.clean()
 
             cmd = f"sudo timeout {scan_timeout}s airodump-ng -w dump --output-format csv --berlin 3 {self.interface}"
-            self.coms(cmd)
-
+            # Use Popen with polling to allow KeyboardInterrupt during execution
+            # Important: Set stdin=DEVNULL to prevent airodump-ng from waiting for input
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    shell=True,
+                    stdin=subprocess.DEVNULL,  # Prevent waiting for input
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    preexec_fn=os.setsid
+                )
+                # Poll the process periodically to allow KeyboardInterrupt to be caught
+                while proc.poll() is None:
+                    time.sleep(0.1)  # Small sleep to allow interrupt
+                if proc.returncode != 0 and proc.returncode != 124:  # 124 is timeout exit code
+                    raise subprocess.CalledProcessError(proc.returncode, cmd)
+            except KeyboardInterrupt:
+                # Kill the subprocess if interrupted
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    proc.wait(timeout=2)
+                except (subprocess.TimeoutExpired, ProcessLookupError):
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=1)
+                    except:
+                        pass
+                raise  # Re-raise KeyboardInterrupt
+        except KeyboardInterrupt:
+            # Re-raise KeyboardInterrupt to stop the main program
+            raise
         except subprocess.CalledProcessError as e:
             if e.returncode == 124:
                 self.log("Airodump-ng timed out as expected.", indent=4, prefix="check")
@@ -746,7 +1007,8 @@ class wifi_cracker:
         self.log(f"Deauth timeout: {target_scan}", indent=4, prefix="dot")
 
         for network in self.wpa2_targets:
-            self.log(f"Targeting WPA2 network: {network}", prefix='moved')
+            channel = self.networks[network]['Channel']
+            self.log(f"Targeting WPA2 network: {network} on channel {channel}", prefix='moved')
             self.capture_handshake(network, auto=True, target_scan=target_scan, packets=packets)
 
         self.log("Automatic collection complete.", prefix="exited")
@@ -756,35 +1018,73 @@ class wifi_cracker:
         target = target_essid
         max_scan_attempts = target_scan_attempts
         max_capture_attempts = capture_attempts
+        unlimited_scan = (max_scan_attempts == 0)
+        unlimited_capture = (max_capture_attempts == 0)
 
-        for scan_attempt in range(1, max_scan_attempts + 1):
-            self.log(f"[Scan Attempt {scan_attempt}] Scanning for {target}...", prefix="moved")
+        if unlimited_scan:
+            self.log("Unlimited scan attempts enabled. Press Ctrl+C to stop.", prefix="error")
+        
+        scan_attempt = 0
+        try:
+            while True:
+                scan_attempt += 1
+                if unlimited_scan:
+                    self.log(f"[Scan Attempt {scan_attempt} (unlimited)] Scanning for {target}...", prefix="moved")
+                else:
+                    if scan_attempt > max_scan_attempts:
+                        break
+                    self.log(f"[Scan Attempt {scan_attempt}/{max_scan_attempts}] Scanning for {target}...", prefix="moved")
 
-            if not self.scan_networks(timeout=initial_scan):
-                self.log("Scan failed.", indent=8, prefix="error")
-                continue
+                try:
+                    if not self.scan_networks(timeout=initial_scan):
+                        self.log("Scan failed.", indent=8, prefix="error")
+                        continue
+                except KeyboardInterrupt:
+                    # Re-raise to be caught by outer handler
+                    raise
 
-            if target in self.networks:
-                self.log(f"Found target ESSID '{target}' on scan attempt {scan_attempt}.", indent=4, prefix="check")
-                break
-            else:
-                self.log(f"Target ESSID '{target}' not found. Retrying...", indent=4, prefix="error")
+                if target in self.networks:
+                    self.log(f"Found target ESSID '{target}' on scan attempt {scan_attempt}.", indent=4, prefix="check")
+                    break
+                else:
+                    self.log(f"Target ESSID '{target}' not found. Retrying...", indent=4, prefix="error")
+        except KeyboardInterrupt:
+            self.log("Scan interrupted by user (Ctrl+C)", prefix="exited")
+            raise  # Re-raise to stop the main program
 
-        else:
+        if not unlimited_scan and scan_attempt > max_scan_attempts:
             self.log(f"Target ESSID '{target}' not found after {max_scan_attempts} scan attempts.", prefix="x")
             return False
 
-        for cap_attempt in range(1, max_capture_attempts + 1):
-            self.log(f"[Capture Attempt {cap_attempt}]", prefix="moved")
-            self.capture_handshake(target, auto=True, target_scan=target_scan, packets=packets)
+        if unlimited_capture:
+            self.log("Unlimited capture attempts enabled. Will continue until EAPOL detected or Ctrl+C.", prefix="config")
 
-            if self.handshake_captured:
-                self.log(f"Handshake capture for '{target}' successful after {cap_attempt} attempts.", indent=8, prefix="check")
-                return True
-            else:
-                self.log(f"No handshake detected on attempt {cap_attempt}. Retrying...", indent=4, prefix="exited")
+        cap_attempt = 0
+        try:
+            while True:
+                cap_attempt += 1
+                if unlimited_capture:
+                    self.log(f"[Capture Attempt {cap_attempt} (unlimited)]", prefix="moved")
+                else:
+                    if cap_attempt > max_capture_attempts:
+                        break
+                    self.log(f"[Capture Attempt {cap_attempt}/{max_capture_attempts}]", prefix="moved")
+                
+                self.capture_handshake(target, auto=True, target_scan=target_scan, packets=packets)
 
-        self.log(f"Failed to capture handshake for '{target}' after {max_capture_attempts} attempts.", prefix="x")
+                if self.handshake_captured:
+                    self.log(f"Handshake capture for '{target}' successful after {cap_attempt} attempts.", indent=8, prefix="check")
+                    return True
+                else:
+                    self.log(f"No handshake detected on attempt {cap_attempt}. Retrying...", indent=4, prefix="exited")
+        except KeyboardInterrupt:
+            self.log("Capture interrupted by user (Ctrl+C)", prefix="exited")
+            raise  # Re-raise to stop the main program
+
+        if not unlimited_capture and cap_attempt > max_capture_attempts:
+            self.log(f"Failed to capture handshake for '{target}' after {max_capture_attempts} attempts.", prefix="x")
+            return False
+        
         return False
 
     def capture_handshake(self, network, auto=False, target_scan=None, packets=None):
@@ -797,7 +1097,7 @@ class wifi_cracker:
         if network not in self.networks:
             self.log(f"Network {network} not found in scan results.", prefix="error")
             return
-        self.log(f"Attempting to capture handshake for: {network}\n", indent=4, prefix="dot")
+        self.log(f"Conducting deauth attack...", indent=4, prefix="dot")
         
         #essid = network.replace(" ", "_")
         essid = re.sub(r'[^\w\-_.]', '_', network)
@@ -806,6 +1106,21 @@ class wifi_cracker:
         timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
         filename = f"{essid}--{bssid}--{channel}--{timestamp}"
         cap_file = f"{filename}-01.cap"
+
+        # Explicitly set interface to target channel before starting capture/deauth
+        # This ensures the interface is on the correct channel for both airodump-ng and aireplay-ng
+        if self.verbose:
+            self.log(f"Setting interface {self.interface} to channel {channel}...", indent=4, prefix="config")
+        try:
+            self.coms(['iw', 'dev', self.interface, 'set', 'channel', channel], 
+                     capture_output=True, check=True, suppress_stderr=True)
+            if self.verbose:
+                self.log(f"Interface set to channel {channel}", indent=8, prefix="check")
+        except subprocess.CalledProcessError as e:
+            if self.verbose:
+                self.log(f"Warning: Failed to set channel via 'iw', airodump-ng will attempt to set it", 
+                        indent=8, prefix="error")
+                self.log(f"Error details: {e}", indent=12, prefix="dash")
 
         # Run a monitor thread on the target network
         airodump_cmd = ["airodump-ng", "-w", filename, "-c", channel, "--bssid", bssid, self.interface]
@@ -819,7 +1134,7 @@ class wifi_cracker:
             preexec_fn=os.setpgrp
         )
 
-        # Give airodump-ng a few seconds to initialize
+        # Give airodump-ng a few seconds to initialize and ensure channel is set
         time.sleep(3)
 
         deauth_proc = self.coms(
@@ -830,7 +1145,22 @@ class wifi_cracker:
 
         # Let both run for the specified target scan time
         scan_time = target_scan if target_scan is not None else 60
-        time.sleep(scan_time)
+        try:
+            time.sleep(scan_time)
+        except KeyboardInterrupt:
+            # If interrupted, clean up processes and re-raise
+            self.log("Capture interrupted. Cleaning up processes...", prefix="exited")
+            for proc in (deauth_proc, airodump_proc):
+                try:
+                    proc.send_signal(signal.SIGTERM)
+                    proc.wait(timeout=2)
+                except (subprocess.TimeoutExpired, ProcessLookupError):
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=1)
+                    except:
+                        pass
+            raise  # Re-raise KeyboardInterrupt to stop the main program
 
         # Terminate processes gracefully
         for proc in (deauth_proc, airodump_proc):
@@ -847,7 +1177,10 @@ class wifi_cracker:
             if eapol_check:
                 self.handshake_captured = True
                 self.log("EAPOL handshake detected.", prefix="check", indent=4)
-                os.makedirs("collection", exist_ok=True)
+                if not os.path.exists("collection"):
+                    self.log("ERROR: 'collection' directory not found.", prefix="x", indent=4)
+                    self.log("Please run './start.sh' to create required directories.", indent=8, prefix="error")
+                    sys.exit(1)
                 os.rename(cap_file, os.path.join("collection", os.path.basename(cap_file)))
                 self.log("Capture moved to /collection", prefix="moved", indent=4)
             else:
@@ -905,7 +1238,10 @@ class wifi_cracker:
             Splits output into EAPOL and PMKID files for John the Ripper.
             """
             john_dir = "john"
-            os.makedirs(john_dir, exist_ok=True)
+            if not os.path.exists(john_dir):
+                self.log(f"ERROR: '{john_dir}' directory not found.", prefix="x", indent=4)
+                self.log("Please run './start.sh' to create required directories.", indent=8, prefix="error")
+                return False
             input_path = f"{john_dir}/{in_file}.john"
             self.log(f"Running JTR .john conversion...",prefix="plus",indent=4)
             with open(input_path, "w") as outfile:
@@ -935,7 +1271,10 @@ class wifi_cracker:
             using hcxpcapngtool.
             """
             hc_dir = "hc"
-            os.makedirs(hc_dir, exist_ok=True)
+            if not os.path.exists(hc_dir):
+                self.log(f"ERROR: '{hc_dir}' directory not found.", prefix="x", indent=4)
+                self.log("Please run './start.sh' to create required directories.", indent=8, prefix="error")
+                return False
             out_path = f"{hc_dir}/{in_file}.22000"
             self.log(f"Running HCX .22000 conversion...",prefix="plus",indent=4)
             self.coms(f"hcxpcapngtool -o {out_path} {cap_path}")
@@ -946,7 +1285,10 @@ class wifi_cracker:
             Moves processed .cap files into the archive/pcap directory 
             for storage.
             """
-            os.makedirs("archive/pcap", exist_ok=True)
+            if not os.path.exists("archive/pcap"):
+                self.log(f"ERROR: 'archive/pcap' directory not found.", prefix="x", indent=4)
+                self.log("Please run './start.sh' to create required directories.", indent=8, prefix="error")
+                return False
             shutil.move(cap_path, f"archive/pcap/{os.path.basename(cap_path)}")
 
         cap_files = glob.glob("collection/*.cap")
@@ -1043,16 +1385,27 @@ class wifi_cracker:
     def init_gps(self, port="/dev/ttyUSB0", baudrate=9600):
         """
         Initialize GPS connection via USB serial port.
+        Note: This is optional if using gpsd - gps3 handles the connection via gpsd.
         """
+        if serial is None:
+            self.log("pyserial not available. GPS serial initialization skipped (using gpsd instead).", indent=4, prefix="dash")
+            return False
+            
         self.gps_port = port
         self.gps_baudrate = baudrate
         
         try:
             self.gps_serial = serial.Serial(port, baudrate, timeout=1)
-            self.log(f"GPS initialized on {port} at {baudrate} baud", indent=4, prefix="check")
+            self.log(f"GPS serial initialized on {port} at {baudrate} baud", indent=4, prefix="check")
             return True
+        except AttributeError as e:
+            self.log(f"Serial module error: {e}", prefix="error")
+            self.log("This may be due to conflicting 'serial' package. Install 'pyserial' instead.", indent=4, prefix="error")
+            self.log("Note: GPS functionality via gpsd (gps3) should still work.", indent=4, prefix="dash")
+            return False
         except Exception as e:
-            self.log(f"Failed to initialize GPS on {port}: {e}", prefix="error")
+            self.log(f"Failed to initialize GPS serial on {port}: {e}", prefix="error")
+            self.log("Note: GPS functionality via gpsd (gps3) should still work.", indent=4, prefix="dash")
             return False
 
     def check_gpsd_running(self, gps_host="127.0.0.1", gps_port=2947):
@@ -1077,127 +1430,538 @@ class wifi_cracker:
         Args:
             gps_device: USB device path (e.g., /dev/ttyUSB0) - used for gpsd setup instructions if not running
         """
+        self.log("GPS", prefix="config")
+        
+        # Check for USB GPS devices first
+        if gps_device:
+            if not os.path.exists(gps_device):
+                self.log(f"GPS device {gps_device} not found.", prefix="error", indent=4)
+                with self.gps_lock:
+                    self.gps_status = 'no_device'
+                if hasattr(self, 'gps_status_callback'):
+                    self.gps_status_callback('no_device')
+                return False
+        
         # Check if gpsd is running
         if not self.check_gpsd_running(gps_host, gps_port):
-            self.log("gpsd is not running or not accessible.", prefix="error")
+            self.log("gpsd is not running or not accessible.", prefix="error", indent=4)
             if gps_device:
-                self.log(f"To start gpsd with your GPS device, run:", prefix="error")
-                self.log(f"  sudo gpsd {gps_device} -F /var/run/gpsd.sock", indent=4, prefix="blank")
-                self.log(f"Or install and start gpsd service:", indent=4, prefix="blank")
-                self.log(f"  sudo apt install gpsd gpsd-clients", indent=4, prefix="blank")
-                self.log(f"  sudo systemctl start gpsd", indent=4, prefix="blank")
-                self.log(f"  sudo systemctl enable gpsd", indent=4, prefix="blank")
+                self.log(f"To start gpsd with your GPS device, run:", prefix="error", indent=4)
+                self.log(f"  sudo gpsd {gps_device} -F /var/run/gpsd.sock", indent=8, prefix="blank")
+                self.log(f"Or install and start gpsd service:", indent=8, prefix="blank")
+                self.log(f"  sudo apt install gpsd gpsd-clients", indent=8, prefix="blank")
+                self.log(f"  sudo systemctl start gpsd", indent=8, prefix="blank")
+                self.log(f"  sudo systemctl enable gpsd", indent=8, prefix="blank")
             else:
-                self.log("Please ensure gpsd is running on port 2947", prefix="error")
+                self.log("Please ensure gpsd is running on port 2947", prefix="error", indent=4)
+            with self.gps_lock:
+                self.gps_status = 'no_data'
+            if hasattr(self, 'gps_status_callback'):
+                self.gps_status_callback('no_data')
             return False
         
+        # Check if GPS thread is already running
+        if self.gps_thread and self.gps_thread.is_alive():
+            self.log("GPS polling already active, reusing existing connection", indent=4, prefix="check")
+            return True
+        
         self.gps_thread_stop.clear()
+        # Initialize GPS status to 'searching' when starting (not 'locked')
+        # This ensures status is correct even if no data is received yet
+        with self.gps_lock:
+            if self.gps_status == 'disabled':
+                self.gps_status = 'searching'
+                if hasattr(self, 'gps_status_callback'):
+                    self.gps_status_callback('searching')
         def poll():
-            gps_socket = gps3.GPSDSocket()
-            data_stream = gps3.DataStream()
+            if self.verbose:
+                self.log(f"GPS polling thread started for device: {gps_device}", indent=4, prefix="dot")
+            gps_socket = None
+            data_stream = None
             try:
+                gps_socket = gps3.GPSDSocket()
+                data_stream = gps3.DataStream()
                 gps_socket.connect(host=gps_host, port=gps_port)
                 gps_socket.watch()
                 self.log("Connected to gpsd successfully.", indent=4, prefix="check")
+                if self.verbose:
+                    self.log(f"Connected to gpsd at {gps_host}:{gps_port}, watching for data...", indent=4, prefix="dot")
                 # Give gpsd a moment to start sending data
                 time.sleep(0.5)
+                
+                # Set socket timeout for non-blocking operation
+                if hasattr(gps_socket, 'socket') and gps_socket.socket:
+                    gps_socket.socket.settimeout(2.0)
+                
+                # Check if gpsd has devices configured by trying to get DEVICES data
+                # If gpsd has no devices, it won't send TPV data and we should detect this
+                if self.verbose:
+                    self.log(f"Starting GPS data polling loop for device: {gps_device}", indent=4, prefix="dot")
+                devices_check_count = 0
+                max_devices_check = 60  # Check for 30 seconds (60 * 0.5s) before first warning
+                
+                # Continuously read GPS data as it arrives
+                no_data_count = 0
+                max_no_data = 20
+                last_status_update = time.time()
+                last_no_data_warning = 0
+                no_data_timeout = 30  # After 30 seconds of no data, assume gpsd has no devices
+                start_time = time.time()
+                last_status_check = time.time()
+                last_gps_data_time = time.time()  # Track when we last received GPS data
+                
+                while not self.gps_thread_stop.is_set():
+                    try:
+                        # Use next() with timeout handling
+                        try:
+                            new_data = next(gps_socket)
+                        except (StopIteration, socket.timeout, OSError):
+                            new_data = None
+                        except Exception as e:
+                            if 'timeout' in str(e).lower() or 'timed out' in str(e).lower():
+                                new_data = None
+                            else:
+                                raise
+                        
+                        if not new_data:
+                            no_data_count += 1
+                            elapsed_time = time.time() - start_time
+                            time_since_last_data = time.time() - last_gps_data_time
+                            
+                            # Only show warning if gpsd has stopped sending data entirely (not just invalid coordinates)
+                            # Check if we've actually received ANY data from gpsd since starting
+                            never_received_data = (last_gps_data_time == start_time)  # Never updated from initial value
+                            very_long_time_since_data = time_since_last_data > 300  # 5 minutes
+                            
+                            # Also check if GPS has valid coordinates recently (indicates GPS is working, just brief timeout)
+                            gps_has_recent_valid_data = False
+                            with self.gps_lock:
+                                if (self.gps_position_last_updated and 
+                                    (time.time() - self.gps_position_last_updated) < 60):  # Had valid coordinates in last minute
+                                    gps_has_recent_valid_data = True
+                            
+                            # Only warn if:
+                            # 1. We've never received ANY data from gpsd (indicates gpsd configuration issue)
+                            # 2. OR it's been 5+ minutes since gpsd last sent ANY data (indicates gpsd stopped working)
+                            # 3. AND GPS hasn't had valid coordinates recently (if GPS was working, don't warn on brief timeouts)
+                            # 4. AND at least 5 minutes since last warning (to avoid spam)
+                            if (time.time() - last_no_data_warning > 300 and  # 5 minutes between warnings
+                                (never_received_data or very_long_time_since_data) and
+                                not gps_has_recent_valid_data):  # Don't warn if GPS was working recently
+                                # Only warn if gpsd itself has stopped sending data, not just temporary coordinate loss
+                                if gps_device:
+                                    if never_received_data:
+                                        self.log(f"gpsd is running but has never sent any data from {gps_device}.", prefix="warning", indent=4)
+                                    else:
+                                        self.log(f"gpsd is running but has not sent any data for {int(time_since_last_data)} seconds.", prefix="warning", indent=4)
+                                    self.log(f"Make sure gpsd is configured with your device:", prefix="warning", indent=4)
+                                    self.log(f"  sudo gpsd {gps_device} -F /var/run/gpsd.sock", indent=8, prefix="blank")
+                                    self.log(f"Or restart gpsd service with device:", indent=8, prefix="blank")
+                                    self.log(f"  sudo systemctl stop gpsd", indent=8, prefix="blank")
+                                    self.log(f"  sudo gpsd {gps_device} -F /var/run/gpsd.sock", indent=8, prefix="blank")
+                                last_no_data_warning = time.time()
+                            
+                            # After extended period with no data, only log error if we've NEVER received data from gpsd
+                            # If GPS was working and then stops, it's likely temporary signal loss, not a gpsd issue
+                            never_received_data = (last_gps_data_time == start_time)
+                            very_long_time_since_data = time_since_last_data > 300  # 5 minutes
+                            
+                            # Also check if GPS has valid coordinates recently (indicates GPS is working, just brief timeout)
+                            gps_has_recent_valid_data = False
+                            with self.gps_lock:
+                                if (self.gps_position_last_updated and 
+                                    (time.time() - self.gps_position_last_updated) < 60):  # Had valid coordinates in last minute
+                                    gps_has_recent_valid_data = True
+                            
+                            # Only log error if we've never received ANY data from gpsd (indicates gpsd configuration issue)
+                            # OR if it's been 5+ minutes since gpsd last sent ANY data (indicates gpsd stopped working)
+                            # AND GPS hasn't had valid coordinates recently (if GPS was working, don't error on brief timeouts)
+                            if (elapsed_time >= no_data_timeout and no_data_count >= max_no_data and 
+                                (never_received_data or very_long_time_since_data) and
+                                not gps_has_recent_valid_data):  # Don't error if GPS was working recently
+                                # Check if we've already logged this error for this timeout period
+                                if not hasattr(self, '_last_no_data_error_log') or (time.time() - self._last_no_data_error_log) > 300:
+                                    if never_received_data:
+                                        self.log(f"gpsd is running but has never sent any GPS data.", prefix="error", indent=4)
+                                    else:
+                                        self.log(f"gpsd is running but has not sent any GPS data for {int(time_since_last_data)} seconds.", prefix="error", indent=4)
+                                    self.log(f"This usually means gpsd is not configured with a GPS device.", prefix="error", indent=4)
+                                    if gps_device:
+                                        self.log(f"To fix this, run:", prefix="error", indent=4)
+                                        self.log(f"  sudo systemctl stop gpsd", indent=8, prefix="blank")
+                                        self.log(f"  sudo gpsd {gps_device} -F /var/run/gpsd.sock", indent=8, prefix="blank")
+                                    self._last_no_data_error_log = time.time()
+                                with self.gps_lock:
+                                    # Update to 'searching' (orange) - GPS is active but no data received
+                                    if self.gps_status not in ('disabled', 'no_device') and self.gps_status != 'searching':
+                                        self.gps_status = 'searching'
+                                        if hasattr(self, 'gps_status_callback'):
+                                            self.gps_status_callback('searching')
+                                # Continue polling in case device is added later
+                            
+                            # Status will be updated by the periodic check above
+                            time.sleep(0.5)
+                            continue
+                        
+                        no_data_count = 0  # Reset on successful read
+                        # Update last_gps_data_time whenever we receive ANY data from gpsd
+                        # This distinguishes between "gpsd not sending data" vs "gpsd sending data but no valid coordinates"
+                        if new_data:
+                            # We received data from gpsd (even if not valid coordinates), so gpsd is working
+                            last_gps_data_time = time.time()
+                        
+                        try:
+                            data_stream.unpack(new_data)
+                            # Check if we have TPV data - TPV is a dict-like object in gps3
+                            # In gps3, TPV is accessed as data_stream.TPV and it's a dict
+                            if not hasattr(data_stream, 'TPV') or not data_stream.TPV:
+                                # Log when we receive data but no TPV (every 10 seconds to avoid spam)
+                                if not hasattr(self, '_last_no_tpv_log') or (time.time() - self._last_no_tpv_log) > 10:
+                                    self.log(f"[GPS DEBUG] Received data from gpsd but no TPV data available yet (data length: {len(new_data) if new_data else 0})", indent=8, prefix="dot")
+                                    self._last_no_tpv_log = time.time()
+                            if hasattr(data_stream, 'TPV') and data_stream.TPV:
+                                tpv = data_stream.TPV
+                                if tpv:  # TPV exists and is not empty
+                                    # TPV in gps3 is a dict, use .get() method
+                                    try:
+                                        mode = tpv.get('mode', 0)
+                                        lat = tpv.get('lat')
+                                        lon = tpv.get('lon')
+                                        alt = tpv.get('alt')
+                                        ts = tpv.get('time')
+                                        
+                                        # Ensure mode is an integer for comparison
+                                        try:
+                                            mode = int(mode) if mode is not None else 0
+                                        except (ValueError, TypeError):
+                                            mode = 0
+                                        
+                                        # Only log GPS TPV data in verbose mode
+                                        if self.verbose and (not hasattr(self, '_last_gps_debug_time') or (time.time() - self._last_gps_debug_time) > 10):
+                                            self.log(f"GPS TPV data: mode={mode}, lat={lat}, lon={lon}, alt={alt}", indent=8, prefix="dot")
+                                            self._last_gps_debug_time = time.time()
+                                        
+                                        # Update position if we have valid coordinates (mode >= 2) and valid lat/lon
+                                        # Check for None, empty string, or "n/a" string
+                                        lat_valid = lat is not None and lat != "" and str(lat).lower() not in ('n/a', 'nan', 'none')
+                                        lon_valid = lon is not None and lon != "" and str(lon).lower() not in ('n/a', 'nan', 'none')
+                                        
+                                        # Only log mode >= 2 debug in verbose mode
+                                        if self.verbose and mode is not None and mode >= 2:
+                                            if not hasattr(self, '_last_mode2_debug') or (time.time() - self._last_mode2_debug) > 10:
+                                                self.log(f"GPS mode={mode} >= 2, lat_valid={lat_valid}, lon_valid={lon_valid}", indent=8, prefix="dot")
+                                                self._last_mode2_debug = time.time()
+                                        
+                                        if mode is not None and mode >= 2 and lat_valid and lon_valid:
+                                            try:
+                                                # Validate lat/lon are valid numbers
+                                                lat_float = float(lat)
+                                                lon_float = float(lon)
+                                                
+                                                # Check for NaN (NaN != NaN is True)
+                                                is_nan = (lat_float != lat_float) or (lon_float != lon_float)
+                                                
+                                                # Check if coordinates are valid (not both 0,0 and not NaN)
+                                                # Allow coordinates even if one is near 0 (e.g., on equator or prime meridian)
+                                                both_zero = (abs(lat_float) < 0.0001 and abs(lon_float) < 0.0001)
+                                                
+                                                # Only log lock attempt in verbose mode
+                                                if self.verbose and (not hasattr(self, '_last_lock_attempt_log') or (time.time() - self._last_lock_attempt_log) > 10):
+                                                    self.log(f"GPS attempting lock: lat={lat_float:.6f}, lon={lon_float:.6f}", indent=8, prefix="dot")
+                                                    self._last_lock_attempt_log = time.time()
+                                                
+                                                if not is_nan and not both_zero:
+                                                    pos = {
+                                                        'latitude': lat_float,
+                                                        'longitude': lon_float,
+                                                        'altitude': float(alt) if alt is not None and str(alt).lower() not in ('n/a', 'nan', 'none') else None,
+                                                        'timestamp': ts
+                                                    }
+                                                    with self.gps_lock:
+                                                        old_status = self.gps_status
+                                                        self.latest_gps_position = pos
+                                                        self.gps_position_last_updated = time.time()
+                                                        # Status is 'locked' (green) when we have valid coordinates
+                                                        self.gps_status = 'locked'
+                                                    
+                                                    # last_gps_data_time is already updated above when we receive ANY data from gpsd
+                                                    # No need to update again here - we want to track when gpsd sends data, not just valid coordinates
+                                                    
+                                                    # Only log GPS data reception if status changed or in verbose mode
+                                                    with self.gps_lock:
+                                                        status_changed = (old_status != 'locked')
+                                                    if status_changed and self.verbose:
+                                                        self.log(f"GPS receiving valid coordinates: lat={lat_float:.6f}, lon={lon_float:.6f}, alt={alt}", indent=8, prefix="success")
+                                                    
+                                                    # Always update status callback when we receive valid data
+                                                    if hasattr(self, 'gps_status_callback'):
+                                                        self.gps_status_callback('locked')
+                                                else:
+                                                    # Coordinates are 0,0 or NaN - log this
+                                                    self.log(f"GPS coordinates invalid - mode={mode}, lat={lat_float}, lon={lon_float}, is_nan={is_nan}, both_zero={both_zero}", indent=8, prefix="warning")
+                                            except (ValueError, TypeError) as e:
+                                                # Invalid coordinates - skip this update
+                                                self.log(f"Invalid GPS coordinates: lat={lat} (type={type(lat).__name__}), lon={lon} (type={type(lon).__name__}), error={e}", prefix="warning", indent=4)
+                                                import traceback
+                                                self.log(f"Traceback: {traceback.format_exc()}", prefix="error", indent=4)
+                                                pass
+                                            except Exception as e:
+                                                # Catch any other exception
+                                                self.log(f"Unexpected error in GPS lock detection: {e}", prefix="error", indent=4)
+                                                import traceback
+                                                self.log(f"Traceback: {traceback.format_exc()}", prefix="error", indent=4)
+                                                pass
+                                        elif mode is not None and mode >= 2:
+                                            # Mode >= 2 but lat/lon are invalid - log this
+                                            if not hasattr(self, '_last_mode2_invalid_log') or (time.time() - self._last_mode2_invalid_log) > 10:
+                                                self.log(f"GPS mode={mode} (2D/3D fix) but invalid coordinates: lat={lat} (type={type(lat).__name__}), lon={lon} (type={type(lon).__name__})", indent=8, prefix="warning")
+                                                self._last_mode2_invalid_log = time.time()
+                                        elif mode is not None and mode >= 1:
+                                            # GPS has data but no fix yet - log this
+                                            if not hasattr(self, '_last_mode1_log') or (time.time() - self._last_mode1_log) > 10:
+                                                self.log(f"GPS mode=1 (no fix yet): lat={lat}, lon={lon}, waiting for 2D/3D fix", indent=8, prefix="dot")
+                                                self._last_mode1_log = time.time()
+                                        else:
+                                            # Mode is 0 or None - log this
+                                            if not hasattr(self, '_last_mode0_log') or (time.time() - self._last_mode0_log) > 10:
+                                                self.log(f"GPS mode=0 (no data): mode={mode}, lat={lat}, lon={lon}", indent=8, prefix="dot")
+                                                self._last_mode0_log = time.time()
+                                    except (AttributeError, TypeError, ValueError) as e:
+                                        # TPV might not have .get() method, try direct access
+                                        try:
+                                            mode = getattr(tpv, 'mode', 0)
+                                            lat = getattr(tpv, 'lat', None)
+                                            lon = getattr(tpv, 'lon', None)
+                                            alt = getattr(tpv, 'alt', None)
+                                            ts = getattr(tpv, 'time', None)
+                                            
+                                            # Ensure mode is an integer for comparison
+                                            try:
+                                                mode = int(mode) if mode is not None else 0
+                                            except (ValueError, TypeError):
+                                                mode = 0
+                                            
+                                            # Only log GPS TPV data in verbose mode (fallback path)
+                                            if self.verbose and (not hasattr(self, '_last_gps_debug_time_fallback') or (time.time() - self._last_gps_debug_time_fallback) > 10):
+                                                self.log(f"GPS TPV data (fallback): mode={mode}, lat={lat}, lon={lon}, alt={alt}", indent=8, prefix="dot")
+                                                self._last_gps_debug_time_fallback = time.time()
+                                            
+                                            # Check for None, empty string, or "n/a" string
+                                            lat_valid = lat is not None and lat != "" and str(lat).lower() not in ('n/a', 'nan', 'none')
+                                            lon_valid = lon is not None and lon != "" and str(lon).lower() not in ('n/a', 'nan', 'none')
+                                            
+                                            if mode is not None and mode >= 2 and lat_valid and lon_valid:
+                                                try:
+                                                    # Validate lat/lon are valid numbers
+                                                    lat_float = float(lat)
+                                                    lon_float = float(lon)
+                                                    # Check if coordinates are valid (not 0,0 which might be invalid, and not NaN)
+                                                    if not (abs(lat_float) < 0.0001 and abs(lon_float) < 0.0001) and not (lat_float != lat_float or lon_float != lon_float):
+                                                        pos = {
+                                                            'latitude': lat_float,
+                                                            'longitude': lon_float,
+                                                            'altitude': float(alt) if alt is not None and str(alt).lower() not in ('n/a', 'nan', 'none') else None,
+                                                            'timestamp': ts
+                                                        }
+                                                        with self.gps_lock:
+                                                            old_status = self.gps_status
+                                                            self.latest_gps_position = pos
+                                                            self.gps_position_last_updated = time.time()
+                                                            self.gps_status = 'locked'
+                                                        
+                                                        # Always log GPS lock achievement (fallback path)
+                                                        self.log(f"GPS LOCK ACHIEVED (fallback): mode={mode}, lat={lat_float:.6f}, lon={lon_float:.6f}, alt={alt}", indent=8, prefix="success")
+                                                        
+                                                        # Update status callback if available (always update to ensure recovery)
+                                                        if hasattr(self, 'gps_status_callback'):
+                                                            self.gps_status_callback('locked')
+                                                    else:
+                                                        # Coordinates are 0,0 or NaN - log this
+                                                        self.log(f"GPS coordinates invalid (0,0 or NaN, fallback) - mode={mode}, lat={lat_float}, lon={lon_float}", indent=8, prefix="warning")
+                                                except (ValueError, TypeError) as e:
+                                                    # Invalid coordinates - skip this update
+                                                    self.log(f"Invalid GPS coordinates (fallback): lat={lat} (type={type(lat).__name__}), lon={lon} (type={type(lon).__name__}), error={e}", prefix="warning", indent=4)
+                                                    pass
+                                            elif mode is not None and mode >= 2:
+                                                # Mode >= 2 but lat/lon are invalid - log this
+                                                if not hasattr(self, '_last_mode2_invalid_log_fallback') or (time.time() - self._last_mode2_invalid_log_fallback) > 10:
+                                                    self.log(f"GPS mode={mode} (2D/3D fix, fallback) but invalid coordinates: lat={lat} (type={type(lat).__name__}), lon={lon} (type={type(lon).__name__})", indent=8, prefix="warning")
+                                                    self._last_mode2_invalid_log_fallback = time.time()
+                                            elif mode is not None and mode >= 1:
+                                                # GPS has data but no fix yet - log this
+                                                if not hasattr(self, '_last_mode1_log_fallback') or (time.time() - self._last_mode1_log_fallback) > 10:
+                                                    self.log(f"GPS mode=1 (no fix yet, fallback): lat={lat}, lon={lon}, waiting for 2D/3D fix", indent=8, prefix="dot")
+                                                    self._last_mode1_log_fallback = time.time()
+                                                # Update status to 'searching' if needed
+                                                # BUT: Never overwrite 'locked' status - if we were locked recently, keep it locked
+                                                with self.gps_lock:
+                                                    # Only update if we're not already locked (to avoid overwriting lock)
+                                                    # Also check if we've been locked recently (within last 5 seconds)
+                                                    current_time = time.time()
+                                                    recently_locked = (
+                                                        hasattr(self, 'gps_position_last_updated') and 
+                                                        self.gps_position_last_updated and 
+                                                        (current_time - self.gps_position_last_updated) < 5.0
+                                                    )
+                                                    
+                                                    if self.gps_status != 'locked' and not recently_locked:
+                                                        # If we were in 'no_data', reset to 'searching' to show recovery
+                                                        if self.gps_status == 'no_data' or self.gps_status != 'searching':
+                                                            self.gps_status = 'searching'
+                                                            if hasattr(self, 'gps_status_callback'):
+                                                                self.gps_status_callback('searching')
+                                            else:
+                                                # Mode is 0 or None - log this
+                                                if not hasattr(self, '_last_mode0_log_fallback') or (time.time() - self._last_mode0_log_fallback) > 10:
+                                                    self.log(f"GPS mode=0 (no data, fallback): mode={mode}, lat={lat}, lon={lon}", indent=8, prefix="dot")
+                                                    self._last_mode0_log_fallback = time.time()
+                                        except Exception:
+                                            pass
+                        except Exception as e:
+                            # Error unpacking GPS data - log but continue
+                            if self.verbose:
+                                self.log(f"Error unpacking GPS data: {e}", prefix="error", indent=4)
+                        
+                        # Periodic status check - runs AFTER processing data to avoid race conditions
+                        # This ensures we check status after updating last_gps_data_time
+                        # IMPORTANT: This check should NOT override status that was just set by valid coordinate reception
+                        # The status is set to 'locked' immediately when valid coordinates are received (line 1685)
+                        # This periodic check only updates status if it's stale or incorrect
+                        current_time = time.time()
+                        if current_time - last_status_check >= 0.5:
+                            with self.gps_lock:
+                                # Check if we have recent valid coordinates (within 15 seconds - matches user requirement)
+                                # gps_position_last_updated is only set when we receive valid lat/lon (mode >= 2, not NaN, not 0,0)
+                                has_recent_valid_data = (
+                                    self.gps_position_last_updated and 
+                                    (current_time - self.gps_position_last_updated) < 15.0
+                                )
+                                
+                                # Also check if gpsd is still sending data (even if coordinates are temporarily invalid)
+                                # This prevents false "searching" status when GPS device is working but coordinates are temporarily unavailable
+                                gpsd_still_sending = (current_time - last_gps_data_time) < 10.0  # Received data from gpsd in last 10 seconds
+                                
+                                # Only update status if it's not disabled or no_device
+                                if self.gps_status not in ('disabled', 'no_device'):
+                                    if has_recent_valid_data:
+                                        # We have valid coordinates within the last 15 seconds - GPS MUST be locked
+                                        # Always set to locked if we have recent valid data, regardless of current status
+                                        # This ensures recovery from searching mode when valid coordinates return
+                                        if self.gps_status != 'locked':
+                                            self.gps_status = 'locked'
+                                            if hasattr(self, 'gps_status_callback'):
+                                                self.gps_status_callback('locked')
+                                    elif gpsd_still_sending:
+                                        # No valid coordinates recently, but gpsd is still sending data
+                                        # GPS device is working, just temporarily no valid coordinates
+                                        # Only change status if we're not already in a valid state
+                                        if self.gps_status == 'locked':
+                                            # Keep locked status - GPS is working, just temporary coordinate issue
+                                            pass
+                                        elif self.gps_status != 'searching':
+                                            # If we weren't locked or searching, switch to searching
+                                            self.gps_status = 'searching'
+                                            if hasattr(self, 'gps_status_callback'):
+                                                self.gps_status_callback('searching')
+                                    else:
+                                        # No valid coordinates for 15+ seconds AND gpsd hasn't sent data for 10+ seconds
+                                        # This indicates GPS might not be working - switch to searching
+                                        # But only if we're not already locked (locked status takes priority)
+                                        if self.gps_status == 'locked':
+                                            # If we're locked, don't switch to searching - might be temporary issue
+                                            # The status will be updated when valid coordinates are received
+                                            pass
+                                        elif self.gps_status != 'searching':
+                                            # Only switch to searching if we're not already there
+                                            self.gps_status = 'searching'
+                                            if hasattr(self, 'gps_status_callback'):
+                                                self.gps_status_callback('searching')
+                            last_status_check = current_time
+                        
+                        # Small sleep to prevent tight loop and allow other threads to run
+                        time.sleep(0.1)
+                        
+                    except Exception as e:
+                        # Don't clear on every error - might be transient
+                        if self.verbose:
+                            self.log(f"GPS polling error: {e}", prefix="error")
+                        # Keep last known position on error
+                        time.sleep(0.5)
+                        continue
             except Exception as e:
                 self.log(f"Failed to connect to gpsd: {e}", prefix="error")
                 self.log("Make sure gpsd is running: sudo systemctl start gpsd", indent=4, prefix="error")
                 with self.gps_lock:
                     self.latest_gps_position = None
                     self.gps_position_last_updated = None
-                return
-            # Continuously read GPS data as it arrives
-            for new_data in gps_socket:
-                if self.gps_thread_stop.is_set():
-                    break
-                if not new_data:
-                    continue
-                try:
-                    data_stream.unpack(new_data)
-                    # Check if we have TPV data - TPV is a dict-like object in gps3
-                    # In gps3, TPV is accessed as data_stream.TPV and it's a dict
-                    if hasattr(data_stream, 'TPV'):
-                        tpv = data_stream.TPV
-                        if tpv:  # TPV exists and is not empty
-                            # TPV in gps3 is a dict, use .get() method
-                            try:
-                                mode = tpv.get('mode', 0)
-                                lat = tpv.get('lat')
-                                lon = tpv.get('lon')
-                                alt = tpv.get('alt')
-                                ts = tpv.get('time')
-                                
-                                # Update position if we have valid coordinates (mode >= 2) and valid lat/lon
-                                if mode is not None and mode >= 2 and lat is not None and lon is not None:
-                                    pos = {
-                                        'latitude': float(lat),
-                                        'longitude': float(lon),
-                                        'altitude': float(alt) if alt is not None else None,
-                                        'timestamp': ts
-                                    }
-                                    with self.gps_lock:
-                                        self.latest_gps_position = pos
-                                        self.gps_position_last_updated = time.time()
-                            except (AttributeError, TypeError, ValueError) as e:
-                                # TPV might not have .get() method, try direct access
-                                try:
-                                    mode = getattr(tpv, 'mode', 0)
-                                    lat = getattr(tpv, 'lat', None)
-                                    lon = getattr(tpv, 'lon', None)
-                                    alt = getattr(tpv, 'alt', None)
-                                    ts = getattr(tpv, 'time', None)
-                                    
-                                    if mode is not None and mode >= 2 and lat is not None and lon is not None:
-                                        pos = {
-                                            'latitude': float(lat),
-                                            'longitude': float(lon),
-                                            'altitude': float(alt) if alt is not None else None,
-                                            'timestamp': ts
-                                        }
-                                        with self.gps_lock:
-                                            self.latest_gps_position = pos
-                                            self.gps_position_last_updated = time.time()
-                                except Exception:
-                                    pass
-                except Exception as e:
-                    # Don't clear on every error - might be transient
-                    if self.verbose:
-                        self.log(f"GPS polling error: {e}", prefix="error")
-                    # Keep last known position on error
-                    pass
+                    self.gps_status = 'no_data'
+                if hasattr(self, 'gps_status_callback'):
+                    self.gps_status_callback('no_data')
+            finally:
+                if gps_socket:
+                    try:
+                        gps_socket.close()
+                    except:
+                        pass
+        self.log("Started GPS polling thread using gps3.", indent=4, prefix="check")
         self.gps_thread = threading.Thread(target=poll, daemon=True)
         self.gps_thread.start()
-        self.log("Started GPS polling thread using gps3.", prefix="check")
-        # Give the polling thread a moment to connect and start receiving data
-        time.sleep(1.0)
+        # Give the polling thread a moment to connect and log the connection message
+        time.sleep(1.5)
         return True
 
     def stop_gps_polling(self):
         """
         Stops the GPS polling thread.
         """
+        if not self.gps_thread:
+            with self.gps_lock:
+                self.gps_status = 'disabled'
+            return  # Already stopped or never started
         self.gps_thread_stop.set()
-        if self.gps_thread:
+        if self.gps_thread and self.gps_thread.is_alive():
             self.gps_thread.join(timeout=2)
-            self.gps_thread = None
-        self.log("Stopped GPS polling thread.", prefix="check")
+        self.gps_thread = None
+        with self.gps_lock:
+            self.gps_status = 'disabled'
+            self.latest_gps_position = None
+            self.gps_position_last_updated = None
+        # Update status callback if available
+        if hasattr(self, 'gps_status_callback'):
+            try:
+                self.gps_status_callback('disabled')
+            except:
+                pass
+        # Only log if we actually stopped something
+        try:
+            self.log("Stopped GPS polling thread.", prefix="check")
+        except:
+            pass  # Don't fail if logging fails during shutdown
 
-    def get_gps_position(self):
+    def get_gps_position(self, timeout=0.1):
         """
         Returns the latest GPS position from the polling thread (if available).
         Returns a copy to avoid race conditions.
+        Uses a non-blocking lock with timeout to prevent deadlocks.
         """
-        with self.gps_lock:
-            if self.latest_gps_position:
-                # Return a deep copy to ensure we get the current state
-                return {
-                    'latitude': self.latest_gps_position.get('latitude'),
-                    'longitude': self.latest_gps_position.get('longitude'),
-                    'altitude': self.latest_gps_position.get('altitude'),
-                    'timestamp': self.latest_gps_position.get('timestamp')
-                }
+        # Try to acquire lock with timeout to prevent blocking indefinitely
+        if self.gps_lock.acquire(blocking=True, timeout=timeout):
+            try:
+                if self.latest_gps_position:
+                    # Return a deep copy to ensure we get the current state
+                    return {
+                        'latitude': self.latest_gps_position.get('latitude'),
+                        'longitude': self.latest_gps_position.get('longitude'),
+                        'altitude': self.latest_gps_position.get('altitude'),
+                        'timestamp': self.latest_gps_position.get('timestamp')
+                    }
+                return None
+            finally:
+                self.gps_lock.release()
+        else:
+            # Lock acquisition timed out - return None to avoid blocking
+            if self.debug:
+                self.log(f"get_gps_position: Lock timeout ({timeout}s), returning None", indent=8, prefix="dot")
             return None
 
     def _nmea_to_decimal(self, nmea_coord, direction):
@@ -1222,82 +1986,142 @@ class wifi_cracker:
         self.tracking_active = True
         session_id = f"track_{self.timestamp}"
 
-        self.log(f"Starting map ID: {session_id}", prefix="moved")
+        self.log(f"Starting map ID: {session_id}", prefix="config")
 
-        # Initialize GPS if not already done
-        if not self.gps_serial:
-            if not self.init_gps():
-                self.log("GPS initialization failed. Ensure GPS is connected and try again.", prefix="x")
-                sys.exit(1)
+        # GPS polling via gps3 should already be started by now (done in main execution)
+        # Note: gps_serial is optional - gps3 handles GPS via gpsd, so serial connection not required
+        # Check if GPS polling is active instead
+        if not self.gps_thread or not self.gps_thread.is_alive():
+            self.log("GPS polling not active. This should not happen.", prefix="error", indent=4)
+            sys.exit(1)
+        
+        # Store original GPS status to restore after map mode (if needed)
+        # GPS status should remain as-is (locked/searching) after map mode completes
 
         def get_fresh_gps_fix():
             """Get the most current GPS position from the device."""
             gps_wait_attempts = 0
             last_seen_position = None
-            while gps_wait_attempts < gps_lock_attempts:
-                # Get the latest GPS position
-                gps_data = self.get_gps_position()
-                
-                # Check if we have valid GPS data
-                if gps_data and gps_data.get('latitude') is not None and gps_data.get('longitude') is not None:
-                    # Check if this is a new position (different coordinates or first time)
-                    is_new_position = (
-                        last_seen_position is None or
-                        abs(gps_data.get('latitude', 0) - last_seen_position.get('latitude', 0)) > 0.000001 or
-                        abs(gps_data.get('longitude', 0) - last_seen_position.get('longitude', 0)) > 0.000001 or
-                        gps_data.get('timestamp') != last_seen_position.get('timestamp')
-                    )
+            try:
+                while gps_wait_attempts < gps_lock_attempts:
+                    # Get the latest GPS position
+                    gps_data = self.get_gps_position()
                     
-                    if is_new_position:
-                        # Wait a brief moment to ensure we have the freshest data
-                        time.sleep(0.3)
-                        # Get it again to ensure we have the absolute latest
-                        fresh_gps_data = self.get_gps_position()
-                        if fresh_gps_data and fresh_gps_data.get('latitude') is not None and fresh_gps_data.get('longitude') is not None:
-                            print(fresh_gps_data)
-                            return fresh_gps_data
+                    # Check if we have valid GPS data
+                    if gps_data and gps_data.get('latitude') is not None and gps_data.get('longitude') is not None:
+                        # Check if this is a new position (different coordinates or first time)
+                        is_new_position = (
+                            last_seen_position is None or
+                            abs(gps_data.get('latitude', 0) - last_seen_position.get('latitude', 0)) > 0.000001 or
+                            abs(gps_data.get('longitude', 0) - last_seen_position.get('longitude', 0)) > 0.000001 or
+                            gps_data.get('timestamp') != last_seen_position.get('timestamp')
+                        )
+                        
+                        if is_new_position:
+                            # Wait a brief moment to ensure we have the freshest data
+                            try:
+                                time.sleep(0.3)
+                            except KeyboardInterrupt:
+                                raise
+                            # Get it again to ensure we have the absolute latest
+                            fresh_gps_data = self.get_gps_position()
+                            if fresh_gps_data and fresh_gps_data.get('latitude') is not None and fresh_gps_data.get('longitude') is not None:
+                                return fresh_gps_data
+                        else:
+                            # Same position - wait a bit longer for GPS to update
+                            if self.verbose:
+                                self.log(f"GPS position unchanged, waiting for update...", indent=8, prefix="error")
+                            try:
+                                time.sleep(1.0)
+                            except KeyboardInterrupt:
+                                raise
+                            continue
                     else:
-                        # Same position - wait a bit longer for GPS to update
+                        # No valid GPS data - show None for troubleshooting
                         if self.verbose:
-                            self.log(f"GPS position unchanged, waiting for update...", indent=8, prefix="error")
-                        time.sleep(1.0)
-                        continue
-                else:
-                    # No valid GPS data - show None for troubleshooting
+                            self.log(f"No valid GPS data (got: {gps_data})", indent=8, prefix="error")
+                    
                     if self.verbose:
-                        self.log(f"No valid GPS data (got: {gps_data})", indent=8, prefix="error")
-                    print(f"GPS data: {gps_data}")
-                
-                if self.verbose:
-                    if gps_wait_attempts == 0:
-                        self.log("Waiting for GPS fix...", indent=4, prefix="error")
-                    else:
-                        self.log(f"No GPS fix yet. Retrying in {gps_lock_wait} seconds... (Attempt {gps_wait_attempts+1}/{gps_lock_attempts})", indent=8, prefix="error")
-                gps_wait_attempts += 1
-                time.sleep(gps_lock_wait)
-            self.log(f"No GPS fix after {gps_lock_attempts} attempts. Exiting.", prefix="x")
-            sys.exit(1)
+                        if gps_wait_attempts == 0:
+                            self.log("Waiting for GPS fix...", indent=4, prefix="error")
+                        else:
+                            self.log(f"No GPS fix yet. Retrying in {gps_lock_wait} seconds... (Attempt {gps_wait_attempts+1}/{gps_lock_attempts})", indent=8, prefix="error")
+                    gps_wait_attempts += 1
+                    try:
+                        time.sleep(gps_lock_wait)
+                    except KeyboardInterrupt:
+                        raise
+                self.log(f"No GPS fix after {gps_lock_attempts} attempts. Exiting.", prefix="x")
+                sys.exit(1)
+            except KeyboardInterrupt:
+                raise  # Re-raise to stop the main program
 
+        unlimited_scans = (max_attempts == 0)
+        if unlimited_scans:
+            self.log("Unlimited scans enabled. Press Ctrl+C to stop.", prefix="error")
+        
+        attempt = 0
         try:
-            for attempt in range(1, max_attempts + 1):
-                self.log(f"[Scan Attempt {attempt}/{max_attempts}]", prefix="moved")
+            while self.tracking_active:
+                attempt += 1
+                
+                # Send periodic keepalive to TAK server if enabled
+                if self.tak_enabled and self.tak_connected:
+                    current_time = time.time()
+                    if (self.tak_last_keepalive is None or 
+                        current_time - self.tak_last_keepalive >= self.tak_keepalive_interval):
+                        try:
+                            self._send_tak_presence()
+                            self.tak_last_keepalive = current_time
+                            if self.verbose:
+                                self.log("Sent TAK keepalive", indent=8, prefix="plus")
+                        except Exception as e:
+                            if self.verbose:
+                                self.log(f"Keepalive failed: {e}", indent=8, prefix="error")
+                            # Check if connection is still alive
+                            if not self.tak_connected:
+                                self.log("TAK connection lost, attempting to reconnect...", prefix="error", indent=4)
+                                reconnect_success = self.init_tak_connection(
+                                    self.tak_host, self.tak_port, self.tak_protocol,
+                                    self.tak_cert_file, self.tak_key_file, self.tak_ca_file, self.tak_api_token,
+                                    cert_password=getattr(self, 'tak_cert_password', None)
+                                )
+                                if not reconnect_success:
+                                    self.log("TAK reconnection failed. Exiting.", prefix="x", indent=4)
+                                    sys.exit(1)
+                if unlimited_scans:
+                    self.log(f"[Scan Attempt {attempt} (unlimited)]", prefix="moved")
+                else:
+                    if attempt > max_attempts:
+                        break
+                    self.log(f"[Scan Attempt {attempt}/{max_attempts}]", prefix="moved")
 
                 # Step 1: Get fresh GPS fix
                 self.log(f"Acquiring GPS location...", indent=4, prefix="dot")
                 gps_data = get_fresh_gps_fix()
                 if self.verbose:
-                    self.log(f"GPS location: {gps_data['latitude']:.6f}, {gps_data['longitude']:.6f} (timestamp: {gps_data.get('timestamp')})", indent=8, prefix="check")
+                    self.log(f"GPS location: {gps_data['latitude']:.6f}, {gps_data['longitude']:.6f}, {gps_data['altitude']:.2f} - timestamp: {gps_data.get('timestamp')}", indent=8, prefix="check")
 
                 # Step 2: Immediately scan for networks
-                if not self.scan_networks(timeout=scan_interval):
-                    self.log("Scan failed.", indent=8, prefix="error")
-                    continue
+                try:
+                    # Check tracking_active before scanning
+                    if not self.tracking_active:
+                        break
+                    if not self.scan_networks(timeout=scan_interval):
+                        self.log("Scan failed.", indent=8, prefix="error")
+                        continue
+                except KeyboardInterrupt:
+                    # Re-raise to be caught by outer handler
+                    raise
 
                 # Step 3: Record all found networks with current GPS data
                 if not self.networks:
                     self.log("No networks found in scan.", indent=4, prefix="error")
                 else:
                     self.log(f"Found {len(self.networks)} networks", indent=4, prefix="check")
+                    
+                    # Collect all network data for this scan
+                    scan_networks = []
                     for essid, net in self.networks.items():
                         self.record_signal_data(
                             essid=essid,
@@ -1307,14 +2131,62 @@ class wifi_cracker:
                             gps_data=gps_data,
                             session_id=session_id
                         )
-                        if self.verbose:
-                            self.log(f"Recorded: {essid} | Signal: {net['Power']} | GPS: {gps_data['latitude']:.6f}, {gps_data['longitude']:.6f}", indent=8, prefix="plus")
-
-                # Step 4: No wait - immediately proceed to next GPS acquisition and scan
+                        # Always log "Recorded:" messages for display/logging purposes
+                        self.log(f"Recorded: {essid} | Signal: {net['Power']} | GPS: {gps_data['latitude']:.6f}, {gps_data['longitude']:.6f}", indent=8, prefix="plus")
+                        
+                        # Collect network data for aggregated CoT message
+                        scan_networks.append({
+                            'essid': essid,
+                            'bssid': net['BSSID'],
+                            'channel': str(net['Channel']) if net['Channel'] else '0',
+                            'signal': str(net['Power']),
+                            'altitude': gps_data.get('altitude', 0.0)
+                        })
+                    
+                    # Send ONE aggregated CoT message for this scan with all networks
+                    if self.tak_enabled and self.tak_connected and scan_networks:
+                        try:
+                            # Build remarks with all network information
+                            remarks_parts = [f"Scan Location: {gps_data['latitude']:.6f}, {gps_data['longitude']:.6f}"]
+                            remarks_parts.append(f"Networks Found: {len(scan_networks)}")
+                            remarks_parts.append("")
+                            remarks_parts.append("Network Details:")
+                            for net in scan_networks:
+                                remarks_parts.append(f"  ESSID: {net['essid']}")
+                                remarks_parts.append(f"    BSSID: {net['bssid']}")
+                                remarks_parts.append(f"    Channel: {net['channel']}")
+                                remarks_parts.append(f"    Signal: {net['signal']} dBm")
+                                remarks_parts.append("")
+                            
+                            remarks = "\n".join(remarks_parts)
+                            
+                            # Use first network's data for the CoT message
+                            first_net = scan_networks[0]
+                            
+                            # Send aggregated CoT message
+                            cot_sent = self.send_tak_cot(
+                                essid=f"Scan_{len(scan_networks)}Nets",
+                                bssid=first_net['bssid'],
+                                channel=first_net['channel'],
+                                signal_strength=first_net['signal'],
+                                gps_data=gps_data,
+                                remarks=remarks
+                            )
+                            
+                            if cot_sent and self.verbose:
+                                self.log(f"Sent aggregated CoT for scan at {gps_data['latitude']:.6f}, {gps_data['longitude']:.6f} with {len(scan_networks)} networks", indent=8, prefix="plus")
+                        except Exception as e:
+                            self.log(f"Failed to send aggregated CoT: {e}", indent=8, prefix="error")
+                            if self.verbose:
+                                import traceback
+                                traceback.print_exc()
+                
         except KeyboardInterrupt:
             self.log("Signal tracking stopped by user", prefix="exited")
             self.tracking_active = False
-
+            raise
+        
+        self.tracking_active = False
         self.clean()
         return True
 
@@ -1408,8 +2280,11 @@ class wifi_cracker:
         for row in rows:
             data.append(dict(zip(columns, row)))
         
-        # Create output directory
-        os.makedirs("tracking", exist_ok=True)
+        # Check output directory exists
+        if not os.path.exists("tracking"):
+            self.log("ERROR: 'tracking' directory not found.", prefix="x")
+            self.log("Please run './start.sh' to create required directories.", indent=4, prefix="error")
+            return False
         
         if output_format == "json":
             filename = f"tracking/tracking_data_{session_id or 'all'}.json"
@@ -1425,6 +2300,898 @@ class wifi_cracker:
         
         self.log(f"Tracking data exported to {filename}", prefix="check")
         return filename
+
+    def load_tak_config(self):
+        """
+        Load TAK server configuration from config/config.ini.
+        Certificate paths are resolved relative to the 'tak' folder.
+        """
+        if not os.path.exists("config/config.ini"):
+            return
+        
+        config = configparser.ConfigParser()
+        config.read("config/config.ini")
+        
+        if "TAK" in config:
+            tak_config = config["TAK"]
+            # Only load if enabled
+            if tak_config.getboolean("enabled", fallback=False):
+                self.tak_enabled = True
+                self.tak_host = tak_config.get("host", "").strip()
+                if self.tak_host:
+                    self.tak_port = tak_config.getint("port", fallback=8087)
+                    self.tak_protocol = tak_config.get("protocol", "tcp").strip().lower()
+                    if self.tak_protocol not in ['tcp', 'udp']:
+                        self.tak_protocol = 'tcp'
+                    
+                    # Certificate files - resolve paths relative to tak folder
+                    cert_file = tak_config.get("cert_file", "").strip()
+                    key_file = tak_config.get("key_file", "").strip()
+                    ca_file = tak_config.get("ca_file", "").strip()
+                    # Note: cert_password is NOT loaded from config/config.ini for security
+                    # Password will be prompted via CLI if needed
+                    if cert_file:
+                        # If path doesn't start with /, assume it's in tak folder
+                        if not os.path.isabs(cert_file):
+                            cert_file = os.path.join("tak", cert_file)
+                        if os.path.exists(cert_file):
+                            self.tak_cert_file = cert_file
+                        else:
+                            self.log(f"TAK cert_file not found: {cert_file}", prefix="warning", indent=4)
+                            self.log(f"  TLS will not be enabled. Check filename in config/config.ini", prefix="warning", indent=4)
+                    if key_file:
+                        if not os.path.isabs(key_file):
+                            key_file = os.path.join("tak", key_file)
+                        if os.path.exists(key_file):
+                            self.tak_key_file = key_file
+                    if ca_file:
+                        if not os.path.isabs(ca_file):
+                            ca_file = os.path.join("tak", ca_file)
+                        if os.path.exists(ca_file):
+                            self.tak_ca_file = ca_file
+                    
+                    # PKCS#12 password is NOT stored - will be prompted via CLI if needed
+                    self.tak_cert_password = None
+                    
+                    # API token
+                    api_token = tak_config.get("api_token", "").strip()
+                    if api_token:
+                        self.tak_api_token = api_token
+
+    def init_tak_connection(self, host, port=8087, protocol='tcp', cert_file=None, key_file=None, ca_file=None, api_token=None, cert_password=None):
+        """
+        Initialize connection to TAK server.
+        Returns True on success, False on failure.
+        """
+        # Note: os, socket, ssl, tempfile, subprocess, time are imported at module level
+        
+        self.tak_enabled = True
+        self.tak_host = host
+        self.tak_port = port
+        self.tak_protocol = protocol.lower()
+        self.tak_cert_file = cert_file
+        self.tak_key_file = key_file
+        self.tak_ca_file = ca_file
+        self.tak_api_token = api_token
+        # Use provided password or fall back to loaded config
+        if cert_password is None:
+            cert_password = getattr(self, 'tak_cert_password', None)
+        
+        if not host:
+            self.log("TAK host not specified", prefix="error", indent=4)
+            return False
+        
+        # Validate certificate files if provided
+        if self.verbose:
+            self.log("TAK Connection Debug - Certificate file validation:", indent=4, prefix="dot")
+            self.log(f"  cert_file parameter: {repr(cert_file)}", indent=8, prefix="dot")
+            self.log(f"  key_file parameter: {repr(key_file)}", indent=8, prefix="dot")
+            self.log(f"  ca_file parameter: {repr(ca_file)}", indent=8, prefix="dot")
+        
+        if cert_file and not os.path.exists(cert_file):
+            self.log(f"Certificate file not found: {cert_file}", prefix="error", indent=4)
+            if self.verbose:
+                self.log(f"  Current working directory: {os.getcwd()}", indent=8, prefix="dot")
+                self.log(f"  Absolute path would be: {os.path.abspath(cert_file)}", indent=8, prefix="dot")
+            return False
+        if key_file and not os.path.exists(key_file):
+            self.log(f"Private key file not found: {key_file}", prefix="error", indent=4)
+            return False
+        if ca_file and not os.path.exists(ca_file):
+            self.log(f"CA certificate file not found: {ca_file}", prefix="error", indent=4)
+            if self.verbose:
+                self.log(f"  Current working directory: {os.getcwd()}", indent=8, prefix="dot")
+                self.log(f"  Absolute path would be: {os.path.abspath(ca_file)}", indent=8, prefix="dot")
+            return False
+        
+        if self.verbose:
+            if cert_file:
+                self.log(f"  cert_file exists: {os.path.exists(cert_file)}", indent=8, prefix="dot")
+                if os.path.exists(cert_file):
+                    self.log(f"  cert_file is .p12/.pfx: {cert_file.lower().endswith(('.p12', '.pfx'))}", indent=8, prefix="dot")
+            if key_file:
+                self.log(f"  key_file exists: {os.path.exists(key_file)}", indent=8, prefix="dot")
+            if ca_file:
+                self.log(f"  ca_file exists: {os.path.exists(ca_file)}", indent=8, prefix="dot")
+        
+        try:
+            if self.tak_protocol == 'tcp':
+                self.tak_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                
+                # Determine if we need TLS
+                # TLS is needed if:
+                # 1. cert_file is a .p12/.pfx file (contains both cert and key)
+                # 2. OR both cert_file and key_file are provided
+                use_tls = False
+                cert_path = None
+                key_path = None
+                
+                if cert_file:
+                    if cert_file.lower().endswith(('.p12', '.pfx')):
+                        # PKCS#12 file contains both cert and key
+                        use_tls = True
+                        # Extract cert and key from .p12 to temporary PEM files
+                        try:
+                            # Note: tempfile, subprocess, os are imported at module level
+                            
+                            temp_cert = tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False)
+                            temp_key = tempfile.NamedTemporaryFile(mode='w', suffix='.pem', delete=False)
+                            temp_cert.close()
+                            temp_key.close()
+                            
+                            # Extract certificate (prompt for password if needed)
+                            # Get password from parameter first, then try empty password
+                            p12_password = cert_password
+                            max_attempts = 5  # Increased to allow for password + legacy retries
+                            attempt = 0
+                            extraction_success = False
+                            use_legacy = False  # Track if we need to use -legacy flag for OpenSSL 3.0+
+                            
+                            while attempt < max_attempts and not extraction_success:
+                                if attempt == 0 and p12_password is None:
+                                    # First attempt: try empty password
+                                    pass_arg = 'pass:'
+                                    if self.verbose:
+                                        self.log("TAK Connection Debug - Trying PKCS#12 extraction without password", indent=4, prefix="dot")
+                                elif p12_password is None:
+                                    # Check if we have a password callback (for GUI mode)
+                                    if hasattr(self, 'tak_password_callback') and self.tak_password_callback:
+                                        try:
+                                            p12_password = self.tak_password_callback()
+                                            if not p12_password:
+                                                self.log("Empty password provided. Trying again...", prefix="warning", indent=4)
+                                                attempt += 1
+                                                continue
+                                            pass_arg = f'pass:{p12_password}'
+                                            if self.verbose:
+                                                self.log("TAK Connection Debug - Using password from callback", indent=4, prefix="dot")
+                                        except Exception as e:
+                                            self.log(f"Password callback failed: {e}", prefix="error", indent=4)
+                                            os.unlink(temp_cert.name)
+                                            os.unlink(temp_key.name)
+                                            return False
+                                    else:
+                                        # Fall back to CLI prompt
+                                        try:
+                                            p12_password = getpass.getpass("Enter PKCS#12 certificate password: ")
+                                            if not p12_password:
+                                                self.log("Empty password provided. Trying again...", prefix="warning", indent=4)
+                                                attempt += 1
+                                                continue
+                                            pass_arg = f'pass:{p12_password}'
+                                            if self.verbose:
+                                                self.log("TAK Connection Debug - Using password from CLI prompt", indent=4, prefix="dot")
+                                        except (KeyboardInterrupt, EOFError):
+                                            self.log("Password entry cancelled.", prefix="error", indent=4)
+                                            os.unlink(temp_cert.name)
+                                            os.unlink(temp_key.name)
+                                            return False
+                                else:
+                                    # Use provided password
+                                    pass_arg = f'pass:{p12_password}'
+                                    if self.verbose:
+                                        self.log("TAK Connection Debug - Using provided password", indent=4, prefix="dot")
+                                
+                                # Build openssl command with optional -legacy flag for OpenSSL 3.0+
+                                cert_cmd = ['openssl', 'pkcs12', '-in', cert_file, '-out', temp_cert.name, 
+                                           '-clcerts', '-nokeys', '-passin', pass_arg]
+                                key_cmd = ['openssl', 'pkcs12', '-in', cert_file, '-out', temp_key.name, 
+                                          '-nocerts', '-nodes', '-passin', pass_arg]
+                                
+                                if use_legacy:
+                                    # Add -legacy flag for OpenSSL 3.0+ compatibility
+                                    cert_cmd.insert(2, '-legacy')
+                                    key_cmd.insert(2, '-legacy')
+                                    if self.verbose:
+                                        self.log("TAK Connection Debug - Using -legacy flag for OpenSSL 3.0+ compatibility", indent=4, prefix="dot")
+                                
+                                cert_result = subprocess.run(
+                                    cert_cmd,
+                                    check=False, capture_output=True, timeout=5
+                                )
+                                # Extract private key
+                                key_result = subprocess.run(
+                                    key_cmd,
+                                    check=False, capture_output=True, timeout=5
+                                )
+                                
+                                if cert_result.returncode == 0 and key_result.returncode == 0:
+                                    extraction_success = True
+                                    cert_path = temp_cert.name
+                                    key_path = temp_key.name
+                                    # Store for cleanup
+                                    self._tak_temp_cert = temp_cert.name
+                                    self._tak_temp_key = temp_key.name
+                                    if self.verbose:
+                                        self.log(f"TAK Connection Debug - Extracted cert and key from PKCS#12", indent=4, prefix="dot")
+                                else:
+                                    cert_err = cert_result.stderr.decode('utf-8', errors='ignore') if cert_result.stderr else ''
+                                    
+                                    # Check if it's an OpenSSL 3.0+ legacy algorithm error FIRST (before incrementing attempt)
+                                    if ('0308010C' in cert_err or 'digital envelope routines' in cert_err.lower() or 
+                                        'unsupported' in cert_err.lower() or 'algorithm' in cert_err.lower()):
+                                        # OpenSSL 3.0+ legacy algorithm error - retry with -legacy flag
+                                        if not use_legacy:
+                                            use_legacy = True
+                                            if self.verbose:
+                                                self.log("TAK Connection Debug - OpenSSL 3.0+ legacy algorithm error detected, retrying with -legacy flag", indent=4, prefix="dot")
+                                            # Don't increment attempt, just retry with legacy flag
+                                            continue
+                                        else:
+                                            # Already tried with legacy flag, must be a different error
+                                            attempt += 1
+                                            if attempt >= max_attempts:
+                                                break
+                                    # Check if it's a password error
+                                    elif 'mac verify error' in cert_err.lower() or 'invalid password' in cert_err.lower():
+                                        attempt += 1
+                                        if attempt < max_attempts:
+                                            self.log("Invalid password. Please try again.", prefix="warning", indent=4)
+                                            p12_password = None  # Reset to prompt again
+                                            use_legacy = False  # Reset legacy flag when password changes
+                                        else:
+                                            break
+                                    else:
+                                        # Not a password or legacy error, increment and break
+                                        attempt += 1
+                                        if attempt >= max_attempts:
+                                            break
+                            
+                            if not extraction_success:
+                                # Cleanup on failure
+                                os.unlink(temp_cert.name)
+                                os.unlink(temp_key.name)
+                                self.log("PKCS#12 extraction failed after multiple attempts.", prefix="error", indent=4)
+                                if self.verbose:
+                                    cert_err = cert_result.stderr.decode('utf-8', errors='ignore') if cert_result.stderr else ''
+                                    key_err = key_result.stderr.decode('utf-8', errors='ignore') if key_result.stderr else ''
+                                    self.log(f"  Certificate extraction error: {cert_err[:200]}", indent=8, prefix="dot")
+                                    self.log(f"  Key extraction error: {key_err[:200]}", indent=8, prefix="dot")
+                                self.log("Convert manually: openssl pkcs12 -in lab-field.p12 -out cert.pem -clcerts -nokeys -passin pass:YOUR_PASSWORD", prefix="error", indent=4)
+                                self.log("                    openssl pkcs12 -in lab-field.p12 -out key.pem -nocerts -nodes -passin pass:YOUR_PASSWORD", prefix="error", indent=4)
+                                return False
+                        except FileNotFoundError:
+                            self.log("openssl not found. Cannot extract PKCS#12 certificate.", prefix="error", indent=4)
+                            self.log("Install openssl or convert .p12 to PEM format manually.", prefix="error", indent=4)
+                            return False
+                        except Exception as e:
+                            self.log(f"PKCS#12 extraction error: {e}", prefix="error", indent=4)
+                            return False
+                    elif key_file:
+                        # Separate cert and key files
+                        use_tls = True
+                        cert_path = cert_file
+                        key_path = key_file
+                
+                # Connect first (TLS handshake happens after connection)
+                # Test basic connectivity first
+                if self.verbose:
+                    self.log(f"TAK Connection Debug - Testing connectivity to {host}:{port}...", indent=4, prefix="dot")
+                    # Try a quick connection test
+                    test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    test_socket.settimeout(2)
+                    try:
+                        test_socket.connect((host, port))
+                        test_socket.close()
+                        self.log("TAK Connection Debug - Basic TCP connectivity test passed", indent=4, prefix="dot")
+                    except Exception as test_e:
+                        self.log(f"TAK Connection Debug - Basic connectivity test failed: {test_e}", indent=4, prefix="warning")
+                        self.log("TAK Connection Debug - This may indicate a firewall or network issue", indent=4, prefix="warning")
+                
+                self.tak_socket.settimeout(10)
+                if self.verbose:
+                    self.log(f"TAK Connection Debug - Connecting to {host}:{port}...", indent=4, prefix="dot")
+                try:
+                    self.tak_socket.connect((host, port))
+                    if self.verbose:
+                        self.log("TAK Connection Debug - TCP connection established", indent=4, prefix="dot")
+                        try:
+                            peer = self.tak_socket.getpeername()
+                            self.log(f"TAK Connection Debug - Connected to {peer[0]}:{peer[1]}", indent=8, prefix="dot")
+                        except:
+                            pass
+                except socket.timeout:
+                    self.log(f"Connection timeout: TAK server at {host}:{port} did not respond within 10 seconds", prefix="error", indent=4)
+                    self.log(f"Port {port} is listening on TAK Server, but connection timed out.", prefix="error", indent=4)
+                    self.log(f"Possible causes:", prefix="error", indent=4)
+                    self.log(f"  1. Firewall blocking port {port} between client and server", indent=8, prefix="dot")
+                    self.log(f"  2. Network routing issue", indent=8, prefix="dot")
+                    self.log(f"  3. TAK Server rejecting connections (check server logs)", indent=8, prefix="dot")
+                    self.log(f"Test connectivity: telnet {host} {port}", indent=4, prefix="dot")
+                    return False
+                except socket.error as e:
+                    self.log(f"Connection error: {e}", prefix="error", indent=4)
+                    self.log(f"Port {port} may not be accessible. Check firewall and TAK Server status.", prefix="error", indent=4)
+                    self.log(f"Test connectivity: telnet {host} {port}", indent=4, prefix="dot")
+                    return False
+                
+                # Wrap with TLS after connection (if using TLS)
+                if use_tls:
+                    # SSL/TLS connection with certificates
+                    try:
+                        # Note: ssl is imported at module level
+                        import ssl
+                        context = ssl.create_default_context()
+                        if ca_file:
+                            context.load_verify_locations(ca_file)
+                        else:
+                            context.check_hostname = False
+                            context.verify_mode = ssl.CERT_NONE
+                        context.load_cert_chain(cert_path, key_path)
+                        
+                        # Determine server hostname for TLS
+                        # If connecting by IP address, don't verify hostname (certificate may be for hostname)
+                        # If connecting by hostname, use it for verification
+                        import re
+                        is_ip = re.match(r'^\d+\.\d+\.\d+\.\d+$', host) is not None
+                        if is_ip:
+                            # Connecting by IP - disable hostname verification
+                            context.check_hostname = False
+                            tls_hostname = None
+                            if self.verbose:
+                                self.log("TAK Connection Debug - Connecting by IP address, hostname verification disabled", indent=4, prefix="dot")
+                        else:
+                            # Connecting by hostname - use it for verification
+                            tls_hostname = host
+                            if self.verbose:
+                                self.log(f"TAK Connection Debug - Connecting by hostname '{host}', hostname verification enabled", indent=4, prefix="dot")
+                        
+                        if self.verbose:
+                            self.log("TAK Connection Debug - Starting TLS/SSL handshake", indent=4, prefix="dot")
+                        self.tak_socket = context.wrap_socket(self.tak_socket, server_hostname=tls_hostname)
+                        if self.verbose:
+                            self.log("TAK Connection Debug - TLS/SSL handshake successful", indent=4, prefix="dot")
+                    except ImportError:
+                        self.log("SSL support not available. Install ssl module.", prefix="error", indent=4)
+                        return False
+                    except ssl.SSLError as e:
+                        self.log(f"SSL/TLS handshake error: {e}", prefix="error", indent=4)
+                        return False
+                    except Exception as e:
+                        self.log(f"TLS handshake error: {e}", prefix="error", indent=4)
+                        return False
+                else:
+                    if self.verbose:
+                        self.log("TAK Connection Debug - Using plain TCP (no TLS)", indent=4, prefix="dot")
+            else:  # UDP
+                self.tak_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                # UDP doesn't require connection, but we can test if host is reachable
+                try:
+                    # Try to resolve hostname
+                    socket.gethostbyname(host)
+                except socket.gaierror:
+                    self.log(f"Cannot resolve TAK server hostname: {host}", prefix="error", indent=4)
+                    return False
+            
+            self.tak_connected = True
+            self.log(f"Connected to TAK server at {host}:{port} via {protocol.upper()}", prefix="check", indent=4)
+            
+            # Verbose connection information for troubleshooting
+            if self.verbose:
+                self.log("TAK Connection Debug - Connection details:", indent=4, prefix="dot")
+                self.log(f"  Host: {host}", indent=8, prefix="dot")
+                self.log(f"  Port: {port}", indent=8, prefix="dot")
+                self.log(f"  Protocol: {protocol.upper()}", indent=8, prefix="dot")
+                # Determine TLS status
+                use_tls_debug = cert_file and (cert_file.lower().endswith(('.p12', '.pfx')) or key_file)
+                self.log(f"  SSL/TLS: {'Yes' if use_tls_debug else 'No'}", indent=8, prefix="dot")
+                if use_tls_debug and cert_file.lower().endswith(('.p12', '.pfx')):
+                    self.log(f"  Certificate Format: PKCS#12 (.p12)", indent=8, prefix="dot")
+                if cert_file:
+                    self.log(f"  Certificate: {cert_file} ({'EXISTS' if os.path.exists(cert_file) else 'NOT FOUND'})", indent=8, prefix="dot")
+                if key_file:
+                    self.log(f"  Private Key: {key_file} ({'EXISTS' if os.path.exists(key_file) else 'NOT FOUND'})", indent=8, prefix="dot")
+                if ca_file:
+                    self.log(f"  CA Certificate: {ca_file} ({'EXISTS' if os.path.exists(ca_file) else 'NOT FOUND'})", indent=8, prefix="dot")
+                self.log(f"  API Token: {'SET' if api_token else 'NOT SET'}", indent=8, prefix="dot")
+                self.log(f"  Socket Type: {type(self.tak_socket).__name__}", indent=8, prefix="dot")
+                if hasattr(self.tak_socket, 'getpeername'):
+                    try:
+                        peer = self.tak_socket.getpeername()
+                        self.log(f"  Remote Address: {peer[0]}:{peer[1]}", indent=8, prefix="dot")
+                    except:
+                        pass
+                if hasattr(self.tak_socket, 'getsockname'):
+                    try:
+                        local = self.tak_socket.getsockname()
+                        self.log(f"  Local Address: {local[0]}:{local[1]}", indent=8, prefix="dot")
+                    except:
+                        pass
+            
+            # Send initial presence message to register with TAK server
+            # TAK Server 5.6 requires this CoT message to recognize the client connection
+            try:
+                if self.debug:
+                    self.log("About to call _send_tak_presence()...", indent=4, prefix="dot")
+                self._send_tak_presence()
+                if self.debug:
+                    self.log("_send_tak_presence() returned", indent=4, prefix="dot")
+                # Small delay to ensure message is sent
+                time.sleep(0.1)
+                
+                # Test connection by checking if socket is still writable
+                if self.tak_protocol == 'tcp':
+                    try:
+                        # Try to send a test packet (non-blocking check)
+                        self.tak_socket.settimeout(0.1)
+                        # Connection is good if we got here
+                        self.tak_socket.settimeout(10)  # Reset timeout
+                        self.log("TAK connection verified - presence message sent", indent=4, prefix="check")
+                        if self.verbose:
+                            self.log("TAK Connection Debug - Connection test passed", indent=4, prefix="dot")
+                    except Exception as e:
+                        self.log(f"TAK connection test failed: {e}", prefix="error", indent=4)
+                        if self.verbose:
+                            import traceback
+                            self.log("TAK Connection Debug - Connection test error:", indent=4, prefix="dot")
+                            for line in traceback.format_exc().split('\n'):
+                                if line.strip():
+                                    self.log(f"  {line}", indent=8, prefix="dot")
+                        self.tak_connected = False
+                        return False
+            except Exception as e:
+                self.log(f"Failed to send initial presence message: {e}", prefix="error", indent=4)
+                self.log("TAK connection failed - cannot proceed without successful registration", prefix="error", indent=4)
+                self.tak_connected = False
+                return False
+            
+            if self.debug:
+                self.log("init_tak_connection: About to return True", indent=4, prefix="dot")
+            return True
+        except socket.timeout:
+            self.log(f"Connection timeout: TAK server at {host}:{port} did not respond", prefix="error", indent=4)
+            self.tak_connected = False
+            return False
+        except socket.gaierror as e:
+            self.log(f"DNS resolution failed for {host}: {e}", prefix="error", indent=4)
+            self.tak_connected = False
+            return False
+        except socket.error as e:
+            self.log(f"Network error connecting to {host}:{port}: {e}", prefix="error", indent=4)
+            self.tak_connected = False
+            return False
+        except Exception as e:
+            self.log(f"Failed to connect to TAK server: {e}", prefix="error", indent=4)
+            self.tak_connected = False
+            return False
+
+    def close_tak_connection(self):
+        """Close TAK server connection."""
+        if self.tak_socket:
+            try:
+                self.tak_socket.close()
+            except:
+                pass
+            self.tak_socket = None
+        self.tak_connected = False
+
+    def _send_tak_presence(self):
+        """
+        Send initial presence message to TAK server to register this client.
+        TAK Server requires this to recognize the connection as a valid client.
+        """
+        from datetime import datetime, timezone, timedelta
+        
+        # Generate unique client UID (use hostname for uniqueness)
+        import socket as sock_module
+        try:
+            hostname = sock_module.gethostname()
+        except:
+            hostname = "mifi"
+        uid = f"MiFi-Scanner-{hostname}"
+        
+        # Current time in ISO 8601 format (TAK Server requires precise timestamps)
+        now = datetime.now(timezone.utc)
+        now_str = now.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+        stale_time = now + timedelta(seconds=120)  # 2 minutes stale
+        stale = stale_time.strftime('%Y-%m-%dT%H:%M:%S') + 'Z'
+        
+        # Create presence event - TAK Server 5.6 compatible format
+        # Use t-x-c-t (presence/contact) type for client registration
+        event = ET.Element('event')
+        event.set('version', '2.0')
+        event.set('uid', uid)
+        event.set('type', 't-x-c-t')  # Presence/contact type for client registration
+        event.set('how', 'm-g')  # Machine-generated (required for automated clients)
+        event.set('time', now_str)
+        event.set('start', now_str)
+        event.set('stale', stale)
+        
+        # Point element - use GPS data if available, otherwise default
+        point = ET.SubElement(event, 'point')
+        if self.debug:
+            self.log("_send_tak_presence: Getting GPS position...", indent=8, prefix="dot")
+        gps_data = self.get_gps_position()
+        if self.debug:
+            self.log(f"_send_tak_presence: GPS data retrieved: {gps_data is not None}", indent=8, prefix="dot")
+        if gps_data and gps_data.get('latitude') and gps_data.get('longitude'):
+            lat = gps_data.get('latitude', 0)
+            lon = gps_data.get('longitude', 0)
+            alt = gps_data.get('altitude', 0) if gps_data.get('altitude') else 0
+            point.set('lat', f'{lat:.8f}')
+            point.set('lon', f'{lon:.8f}')
+            point.set('hae', f'{alt:.1f}' if alt else '9999999.0')
+        else:
+            point.set('lat', '0.0')
+            point.set('lon', '0.0')
+            point.set('hae', '9999999.0')
+        point.set('ce', '9999999.0')
+        point.set('le', '9999999.0')
+        
+        # Detail element with contact information
+        detail = ET.SubElement(event, 'detail')
+        contact = ET.SubElement(detail, 'contact')
+        contact.set('callsign', 'MiFi-Scanner')
+        contact.set('endpoint', '*:-1:stcp')
+        
+        # Status element - indicates this is a presence/status update
+        status = ET.SubElement(detail, 'status')
+        status.set('battery', '100')
+        status.set('readiness', 'true')
+        
+        # Track element - helps TAK Server track the client
+        track = ET.SubElement(detail, 'track')
+        track.set('course', '0.0')
+        track.set('speed', '0.0')
+        
+        # Precision location (optional but helps TAK Server)
+        precisionlocation = ET.SubElement(detail, 'precisionlocation')
+        precisionlocation.set('geopointsrc', 'GPS')
+        precisionlocation.set('altsrc', 'GPS')
+        
+        # Remarks element - additional info for TAK Server
+        remarks = ET.SubElement(detail, 'remarks')
+        remarks.text = f"MiFi WiFi Scanner - Host: {hostname}"
+        
+        # Link element - important for TAK Server to track the source
+        link = ET.SubElement(detail, 'link')
+        link.set('uid', uid)
+        link.set('type', 'a-f-G-U-C')  # Unit type for the link
+        link.set('relation', 'p-p')  # Parent-parent relation
+        
+        # Convert to XML and send
+        if self.debug:
+            self.log("_send_tak_presence: Converting to XML...", indent=8, prefix="dot")
+        xml_str = ET.tostring(event, encoding='unicode')
+        
+        if self.tak_protocol == 'tcp':
+            message = xml_str.encode('utf-8')
+            length = len(message)
+            header = length.to_bytes(4, byteorder='big')
+            try:
+                if self.debug:
+                    self.log(f"_send_tak_presence: About to send {len(header) + len(message)} bytes...", indent=8, prefix="dot")
+                # Set a timeout to prevent hanging
+                original_timeout = self.tak_socket.gettimeout()
+                if self.debug:
+                    self.log(f"_send_tak_presence: Original timeout: {original_timeout}, setting to 5.0", indent=8, prefix="dot")
+                self.tak_socket.settimeout(5.0)  # 5 second timeout for send
+                if self.debug:
+                    self.log("_send_tak_presence: Calling sendall()...", indent=8, prefix="dot")
+                self.tak_socket.sendall(header + message)
+                if self.debug:
+                    self.log("_send_tak_presence: sendall() completed successfully", indent=8, prefix="dot")
+                # Restore original timeout (or None if it was None)
+                self.tak_socket.settimeout(original_timeout)
+                if self.verbose:
+                    self.log(f"TAK Presence Debug - Sent {len(header) + len(message)} bytes (header: {len(header)}, payload: {len(message)})", indent=4, prefix="dot")
+            except Exception as e:
+                if self.verbose:
+                    self.log(f"TAK Presence Debug - Send error: {e}", indent=4, prefix="error")
+                # Restore timeout even on error
+                try:
+                    self.tak_socket.settimeout(original_timeout)
+                except:
+                    pass
+                raise
+        else:  # UDP
+            bytes_sent = self.tak_socket.sendto(xml_str.encode('utf-8'), (self.tak_host, self.tak_port))
+            if self.verbose:
+                self.log(f"TAK Presence Debug - Sent {bytes_sent} bytes via UDP", indent=4, prefix="dot")
+        
+        if self.verbose:
+            self.log(f"Sent TAK presence message (UID: {uid}, Type: t-x-c-t, How: m-g)", indent=4, prefix="check")
+            self.log(f"TAK Presence Debug - Presence CoT XML:", indent=4, prefix="dot")
+            preview = xml_str[:500] + "..." if len(xml_str) > 500 else xml_str
+            for line in preview.split('\n')[:10]:  # First 10 lines
+                if line.strip():
+                    self.log(f"  {line.strip()}", indent=8, prefix="dot")
+        else:
+            self.log("Sent TAK presence message to register client", indent=4, prefix="check")
+
+    def generate_cot_message(self, essid, bssid, channel, signal_strength, gps_data, event_type='a-f-G-E-V-C', remarks=None):
+        """
+        Generate a CoT (Cursor on Target) XML message for WiFi network data.
+        Format is compatible with TAK Server 5.6 native CoT reception.
+        
+        Args:
+            essid: Network ESSID (name)
+            bssid: Network BSSID (MAC address)
+            channel: WiFi channel
+            signal_strength: Signal strength in dBm
+            gps_data: Dictionary with 'latitude', 'longitude', 'altitude'
+            event_type: CoT event type (default: 'a-f-G-E-V-C' for equipment)
+            remarks: Optional custom remarks text (if None, generates default remarks)
+        
+        Returns:
+            XML string in CoT format
+        """
+        from datetime import datetime, timezone, timedelta
+        
+        # Generate unique UID from BSSID (ensures each network has unique identifier)
+        # Ensure bssid is a string (define once, use throughout)
+        try:
+            bssid_str = str(bssid) if bssid else 'unknown'
+            uid = f"mifi-{bssid_str.replace(':', '').lower()}"
+        except Exception as e:
+            # Verbose debugging
+            if hasattr(self, 'verbose') and self.verbose:
+                self.log(f"TAK CoT Debug - Error in UID generation: {e}", indent=8, prefix="dot")
+                self.log(f"TAK CoT Debug - bssid value: {repr(bssid)}, type: {type(bssid)}", indent=8, prefix="dot")
+            raise
+        
+        # Current time in ISO 8601 format (TAK Server requires UTC timestamps)
+        now = datetime.now(timezone.utc)
+        now_str = now.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+        # Use very long stale time (24 hours) so data persists on TAK map after execution completes
+        stale_time = now + timedelta(hours=24)  # 24 hours stale - data persists on map
+        stale = stale_time.strftime('%Y-%m-%dT%H:%M:%S') + 'Z'
+        
+        # Create CoT event element - TAK Server 5.6 compatible format
+        event = ET.Element('event')
+        event.set('version', '2.0')
+        event.set('uid', uid)
+        event.set('type', event_type)
+        event.set('how', 'm-g')  # Machine-generated (required for automated clients)
+        event.set('time', now_str)
+        event.set('start', now_str)
+        event.set('stale', stale)
+        
+        # Point element with GPS coordinates (required by TAK Server)
+        point = ET.SubElement(event, 'point')
+        lat = gps_data.get('latitude', 0)
+        lon = gps_data.get('longitude', 0)
+        alt = gps_data.get('altitude', 0) if gps_data.get('altitude') else 0
+        
+        point.set('lat', f'{lat:.8f}')
+        point.set('lon', f'{lon:.8f}')
+        point.set('hae', f'{alt:.1f}' if alt else '9999999.0')
+        point.set('ce', '50.0')  # Circular error in meters (reasonable estimate)
+        point.set('le', '50.0')  # Linear error in meters
+        
+        # Detail element with network information
+        detail = ET.SubElement(event, 'detail')
+        
+        # Contact element - network identification
+        contact = ET.SubElement(detail, 'contact')
+        # Ensure essid is a string
+        essid_str = str(essid) if essid else 'Unknown'
+        contact.set('callsign', essid_str)
+        contact.set('endpoint', '*:-1:stcp')
+        
+        # Status element - signal strength as battery metaphor
+        status = ET.SubElement(detail, 'status')
+        # Convert signal strength to battery percentage (rough approximation)
+        # -30 dBm = 100%, -90 dBm = 0%
+        # Ensure signal_strength is converted to int/float first
+        try:
+            signal_num = float(signal_strength) if isinstance(signal_strength, str) else signal_strength
+            battery = max(0, min(100, int((signal_num + 90) * 100 / 60)))
+        except (ValueError, TypeError) as e:
+            # If conversion fails, default to 50%
+            if hasattr(self, 'verbose') and self.verbose:
+                self.log(f"TAK CoT Debug - Error converting signal_strength: {e}, using default 50%", indent=8, prefix="dot")
+            battery = 50
+        status.set('battery', str(battery))
+        
+        # Track element (optional, but helps TAK Server)
+        track = ET.SubElement(detail, 'track')
+        track.set('course', '0.0')
+        track.set('speed', '0.0')
+        
+        # Remarks element with comprehensive network details
+        remarks_elem = ET.SubElement(detail, 'remarks')
+        # Use custom remarks if provided, otherwise generate default
+        if remarks is not None:
+            remarks_elem.text = remarks
+        else:
+            # Ensure all values are strings to avoid concatenation errors
+            try:
+                bssid_str_remarks = str(bssid) if bssid else 'Unknown'
+                channel_str = str(channel) if channel is not None else 'Unknown'
+                signal_str = str(signal_strength) if signal_strength is not None else 'Unknown'
+                
+                # Format timestamp from gps_data if available
+                timestamp_str = 'Unknown'
+                if gps_data and 'timestamp' in gps_data:
+                    try:
+                        # Try to format the timestamp nicely
+                        if isinstance(gps_data['timestamp'], str):
+                            timestamp_str = gps_data['timestamp']
+                        else:
+                            timestamp_str = str(gps_data['timestamp'])
+                    except Exception:
+                        timestamp_str = str(gps_data.get('timestamp', 'Unknown'))
+                
+                # Format coordinates
+                coord_str = f"{lat:.6f}, {lon:.6f}"
+                if alt and alt != 0:
+                    coord_str += f", {alt:.1f}m"
+                
+                # Create comprehensive remarks with all network data
+                remarks_elem.text = f"WiFi Network: {essid_str}\nBSSID: {bssid_str_remarks}\nChannel: {channel_str}\nSignal: {signal_str} dBm\nCoordinates: {coord_str}\nTimestamp: {timestamp_str}"
+            except Exception as e:
+                # Verbose debugging
+                if hasattr(self, 'verbose') and self.verbose:
+                    self.log(f"TAK CoT Debug - Error in remarks generation: {e}", indent=8, prefix="dot")
+                    self.log(f"TAK CoT Debug - essid_str: {repr(essid_str)}, type: {type(essid_str)}", indent=8, prefix="dot")
+                    self.log(f"TAK CoT Debug - bssid: {repr(bssid)}, type: {type(bssid)}", indent=8, prefix="dot")
+                    self.log(f"TAK CoT Debug - channel: {repr(channel)}, type: {type(channel)}", indent=8, prefix="dot")
+                    self.log(f"TAK CoT Debug - signal_strength: {repr(signal_strength)}, type: {type(signal_strength)}", indent=8, prefix="dot")
+                # Fallback to simple remarks on error
+                remarks_elem.text = f"WiFi Network: {essid_str}"
+        
+        # Usericon element - MIL-STD-2525 icon (equipment)
+        usericon = ET.SubElement(detail, 'usericon')
+        usericon.set('iconsetpath', 'COT_MAPPING_2525C/a-f-G-E-V-C')
+        
+        # Additional metadata in _flow-tags_ (custom extension)
+        _flow_tags_ = ET.SubElement(detail, '_flow-tags_')
+        _flow_tags_.set('mifi', 'wifi-network')
+        # Use string versions of values (ensure they're defined)
+        bssid_str_flow = str(bssid) if bssid else 'Unknown'
+        channel_str_flow = str(channel) if channel is not None else 'Unknown'
+        signal_str_flow = str(signal_strength) if signal_strength is not None else 'Unknown'
+        _flow_tags_.set('bssid', bssid_str_flow)
+        _flow_tags_.set('channel', channel_str_flow)
+        _flow_tags_.set('signal', signal_str_flow)
+        
+        # Convert to XML string
+        xml_str = ET.tostring(event, encoding='unicode')
+        return xml_str
+
+    def send_tak_cot(self, essid, bssid, channel, signal_strength, gps_data, remarks=None):
+        """
+        Send a CoT message to TAK server in TAK Server 5.6 compatible format.
+        Uses native CoT XML format with proper TCP/UDP protocol handling.
+        
+        Args:
+            essid: Network ESSID
+            bssid: Network BSSID
+            channel: Network channel
+            signal_strength: Signal strength in dBm
+            gps_data: Dictionary with latitude, longitude, altitude, timestamp
+            remarks: Optional custom remarks text (if None, generates default remarks)
+        """
+        # Check if TAK is enabled and connected with a valid socket
+        if not self.tak_enabled or not self.tak_connected or not self.tak_socket:
+            return False
+        
+        # Verbose debugging: Log input parameters
+        if self.verbose:
+            self.log(f"TAK CoT Debug - Input parameters:", indent=8, prefix="dot")
+            self.log(f"  essid: {repr(essid)} (type: {type(essid).__name__})", indent=12, prefix="dot")
+            self.log(f"  bssid: {repr(bssid)} (type: {type(bssid).__name__})", indent=12, prefix="dot")
+            self.log(f"  channel: {repr(channel)} (type: {type(channel).__name__})", indent=12, prefix="dot")
+            self.log(f"  signal_strength: {repr(signal_strength)} (type: {type(signal_strength).__name__})", indent=12, prefix="dot")
+            self.log(f"  gps_data: {repr(gps_data)} (type: {type(gps_data).__name__})", indent=12, prefix="dot")
+            self.log(f"  remarks: {repr(remarks)} (type: {type(remarks).__name__})", indent=12, prefix="dot")
+        
+        try:
+            # Generate CoT XML message (TAK Server 5.6 compatible format)
+            if self.verbose:
+                self.log("TAK CoT Debug - Calling generate_cot_message()...", indent=8, prefix="dot")
+            cot_xml = self.generate_cot_message(essid, bssid, channel, signal_strength, gps_data, remarks=remarks)
+            if self.verbose:
+                self.log(f"TAK CoT Debug - Generated XML length: {len(cot_xml)} bytes", indent=8, prefix="dot")
+                self.log(f"TAK CoT Debug - XML preview (first 200 chars): {cot_xml[:200]}", indent=8, prefix="dot")
+            
+            if self.tak_protocol == 'tcp':
+                # TAK Server TCP protocol: 4-byte big-endian length prefix + XML payload
+                message = cot_xml.encode('utf-8')
+                length = len(message)
+                # Verify length is reasonable (TAK Server has message size limits)
+                if length > 65535:
+                    self.log(f"CoT message too large ({length} bytes), truncating", prefix="error", indent=8)
+                    return False
+                header = length.to_bytes(4, byteorder='big')
+                try:
+                    bytes_sent = self.tak_socket.sendall(header + message)
+                    if self.verbose:
+                        self.log(f"TAK CoT Debug - Sent {len(header) + len(message)} bytes (header: {len(header)}, payload: {len(message)})", indent=8, prefix="dot")
+                except Exception as e:
+                    if self.verbose:
+                        self.log(f"TAK CoT Debug - Send error: {e}", indent=8, prefix="error")
+                    raise
+            else:  # UDP
+                # UDP: Send XML directly (no length prefix for UDP)
+                message = cot_xml.encode('utf-8')
+                if len(message) > 65507:  # UDP max payload size
+                    self.log(f"CoT message too large for UDP ({len(message)} bytes)", prefix="error", indent=8)
+                    return False
+                self.tak_socket.sendto(message, (self.tak_host, self.tak_port))
+            
+            if self.verbose:
+                self.log(f"Sent TAK CoT for {essid} ({bssid}) - {len(cot_xml)} bytes", indent=8, prefix="plus")
+                self.log(f"TAK CoT Debug - Message sent successfully via {self.tak_protocol.upper()}", indent=8, prefix="dot")
+                # Show a preview of the CoT message
+                if len(cot_xml) > 0:
+                    preview = cot_xml[:300] + "..." if len(cot_xml) > 300 else cot_xml
+                    self.log(f"TAK CoT Debug - CoT XML preview:", indent=8, prefix="dot")
+                    for line in preview.split('\n')[:5]:  # First 5 lines
+                        if line.strip():
+                            self.log(f"  {line.strip()}", indent=12, prefix="dot")
+            else:
+                # Log first few messages to confirm TAK is working
+                if not hasattr(self, '_tak_message_count'):
+                    self._tak_message_count = 0
+                self._tak_message_count += 1
+                if self._tak_message_count <= 3:
+                    self.log(f"Sent TAK CoT message #{self._tak_message_count} for {essid}", indent=8, prefix="plus")
+            return True
+        except socket.error as e:
+            self.log(f"Network error sending TAK CoT: {e}", prefix="error", indent=8)
+            if self.verbose:
+                import traceback
+                self.log(f"TAK CoT Debug - Network error traceback:", indent=8, prefix="dot")
+                for line in traceback.format_exc().split('\n'):
+                    if line.strip():
+                        self.log(f"  {line}", indent=12, prefix="dot")
+            self.tak_connected = False
+            # Don't try to reconnect automatically - let the main loop handle it
+            return False
+        except Exception as e:
+            self.log(f"Failed to send TAK CoT: {e}", prefix="error", indent=8)
+            # Verbose debugging: Show full traceback and error details
+            if self.verbose:
+                import traceback
+                self.log(f"TAK CoT Debug - Error type: {type(e).__name__}", indent=8, prefix="dot")
+                self.log(f"TAK CoT Debug - Error message: {str(e)}", indent=8, prefix="dot")
+                self.log(f"TAK CoT Debug - Full traceback:", indent=8, prefix="dot")
+                for line in traceback.format_exc().split('\n'):
+                    if line.strip():
+                        self.log(f"  {line}", indent=12, prefix="dot")
+                # Show the problematic line if available
+                if hasattr(e, '__traceback__') and e.__traceback__:
+                    tb = e.__traceback__
+                    while tb.tb_next:
+                        tb = tb.tb_next
+                    frame = tb.tb_frame
+                    self.log(f"TAK CoT Debug - Error location: {frame.f_code.co_filename}:{tb.tb_lineno}", indent=8, prefix="dot")
+                    self.log(f"TAK CoT Debug - Code context:", indent=8, prefix="dot")
+                    try:
+                        import linecache
+                        line = linecache.getline(frame.f_code.co_filename, tb.tb_lineno)
+                        self.log(f"  Line {tb.tb_lineno}: {line.strip()}", indent=12, prefix="dot")
+                    except:
+                        pass
+            # If it's a timestamp error, this is a critical bug - log it clearly
+            if "second must be in" in str(e) or "minute must be in" in str(e):
+                self.log("CRITICAL: Timestamp calculation error - this should not happen", prefix="error", indent=8)
+            # If it's a concatenation error, provide more context
+            if "can only concatenate" in str(e) or "must be str" in str(e):
+                self.log("CRITICAL: String concatenation error - check variable types", prefix="error", indent=8)
+            return False
 
 class RawFormatter(argparse.HelpFormatter):
     def _fill_text(self, text, width, indent):
@@ -1450,8 +3217,387 @@ def reexec_with_nohup():
         )
     sys.exit(0)
 
+class InteractiveCLIState:
+    """State container for interactive CLI session"""
+    def __init__(self):
+        self.gps_active = False
+        self.tak_active = False
+        self.tak_password = None
+
+def _run_interactive_cli(suite, version):
+    """Run interactive CLI server with persistent services"""
+    import shlex
+    
+    # Welcome banner with ASCII art
+    banner = f"""
+    ╔══════════════════════════════════════════════════════════════╗
+    ║                                                              ║
+    ║        ███╗   ███╗██╗███████╗██╗                           ║
+    ║        ████╗ ████║██║██╔════╝██║                           ║
+    ║        ██╔████╔██║██║█████╗  ██║                           ║
+    ║        ██║╚██╔╝██║██║██╔══╝  ██║                           ║
+    ║        ██║ ╚═╝ ██║██║██║     ██║                           ║
+    ║        ╚═╝     ╚═╝╚═╝╚═╝     ╚═╝                           ║
+    ║                                                              ║
+    ║     Handshake Collector and Processor Tool v{version}        ║
+    ║                                                              ║
+    ╚══════════════════════════════════════════════════════════════╝
+    """
+    print(banner)
+    print("    Initializing system...\n")
+    
+    # Initial configuration checks
+    suite.initial_config()
+    
+    print("\n    ✓ System Ready\n")
+    print("    Type 'help' or '-h' for available commands")
+    print("    Type 'q' or 'quit' to exit\n")
+    
+    # Background service states
+    cli_state = InteractiveCLIState()
+    
+    # Main command loop
+    while True:
+        try:
+            # Show status indicators
+            status_line = "    ["
+            if cli_state.gps_active:
+                status_line += "GPS:ON "
+            else:
+                status_line += "GPS:OFF "
+            if cli_state.tak_active:
+                status_line += "TAK:ON"
+            else:
+                status_line += "TAK:OFF"
+            status_line += "]"
+            print(status_line)
+            
+            # Get user input
+            command = input("mifi> ").strip()
+            
+            if not command:
+                continue
+            
+            # Handle quit
+            if command.lower() in ['q', 'quit', 'exit']:
+                print("\n    Shutting down...")
+                if cli_state.gps_active:
+                    suite.stop_gps_polling()
+                if cli_state.tak_active and suite.tak_socket:
+                    try:
+                        suite.tak_socket.close()
+                    except:
+                        pass
+                print("    Goodbye!\n")
+                break
+            
+            # Handle help
+            if command.lower() in ['-h', '--help', 'help']:
+                # Show interactive help (full argparse help is available via original CLI)
+                _print_interactive_help()
+                continue
+            
+            # Handle GPS toggle
+            if command.lower() == 'gps':
+                if cli_state.gps_active:
+                    suite.stop_gps_polling()
+                    cli_state.gps_active = False
+                    suite.log("GPS polling stopped", prefix="check")
+                else:
+                    gps_port = suite.gps_port if suite.gps_port else "/dev/ttyUSB0"
+                    if suite.start_gps_polling(gps_device=gps_port):
+                        cli_state.gps_active = True
+                        suite.log("GPS polling started", prefix="check")
+                    else:
+                        suite.log("Failed to start GPS polling. Ensure gpsd is running.", prefix="x")
+                continue
+            
+            # Handle TAK toggle
+            if command.lower() == 'tak':
+                if cli_state.tak_active:
+                    if suite.tak_socket:
+                        try:
+                            suite.tak_socket.close()
+                        except:
+                            pass
+                    suite.tak_connected = False
+                    cli_state.tak_active = False
+                    cli_state.tak_password = None
+                    suite.log("TAK connection closed", prefix="check")
+                else:
+                    if not suite.tak_enabled:
+                        suite.log("TAK not configured. Configure in config/config.ini [TAK] section first.", prefix="x")
+                        continue
+                    
+                    # Get password if needed
+                    if not cli_state.tak_password:
+                        import getpass
+                        try:
+                            cli_state.tak_password = getpass.getpass("    Enter PKCS#12 certificate password: ")
+                        except KeyboardInterrupt:
+                            print("\n    Cancelled.")
+                            continue
+                    
+                    suite.log("Connecting to TAK server...", prefix="config")
+                    success = suite.init_tak_connection(
+                        host=suite.tak_host,
+                        port=suite.tak_port,
+                        protocol=suite.tak_protocol,
+                        cert_file=suite.tak_cert_file,
+                        key_file=suite.tak_key_file,
+                        ca_file=suite.tak_ca_file,
+                        api_token=suite.tak_api_token,
+                        cert_password=cli_state.tak_password
+                    )
+                    
+                    if success:
+                        cli_state.tak_active = True
+                        suite.log("TAK connection established", prefix="check")
+                    else:
+                        cli_state.tak_password = None  # Clear invalid password
+                        suite.log("TAK connection failed", prefix="x")
+                continue
+            
+            # Parse and execute command
+            try:
+                # Parse command like "collect -auto -IS 5"
+                cmd_parts = shlex.split(command)
+                if not cmd_parts:
+                    continue
+                
+                mode_cmd = cmd_parts[0]
+                cmd_args = cmd_parts[1:] if len(cmd_parts) > 1 else []
+                
+                # Parse arguments into dict
+                parsed_args = {}
+                i = 0
+                while i < len(cmd_args):
+                    arg = cmd_args[i]
+                    if arg.startswith('-'):
+                        # Remove leading dashes
+                        key = arg.lstrip('-')
+                        # Skip boolean flags that don't take values (like -tak, -auto, -manual)
+                        if key.lower() in ['tak', 'auto', 'manual', 'a', 'm']:
+                            parsed_args[key.lower()] = True
+                            i += 1
+                        # Check if next arg is a value
+                        elif i + 1 < len(cmd_args) and not cmd_args[i + 1].startswith('-'):
+                            parsed_args[key] = cmd_args[i + 1]
+                            i += 2
+                        else:
+                            parsed_args[key] = True
+                            i += 1
+                    else:
+                        i += 1
+                
+                # Execute mode
+                _execute_interactive_mode(suite, mode_cmd, parsed_args, cli_state)
+                
+            except Exception as e:
+                suite.log(f"Error executing command: {e}", prefix="x")
+                import traceback
+                if suite.verbose:
+                    traceback.print_exc()
+            
+            print()  # Blank line after command
+            
+        except KeyboardInterrupt:
+            print("\n\n    Interrupted. Type 'q' to quit or continue with commands.")
+        except EOFError:
+            print("\n    Goodbye!\n")
+            break
+
+def _print_interactive_help():
+    """Print help for interactive mode"""
+    help_text = """
+    Available Commands:
+    
+    Mode Commands:
+      collect -manual [options]    Manual collection mode
+      collect -auto [options]       Automated collection mode
+      process -manual [options]    Manual processing mode
+      process -auto [options]       Automated processing mode
+      target [options]              Target specific network
+      map [options]                 GPS mapping mode
+      config                        Configure interface
+      clean                         Clean logs and database
+    
+    Service Commands:
+      gps                           Toggle GPS polling service
+      tak                           Toggle TAK connection service
+    
+    Options (examples):
+      -IS <seconds>                 Initial scan timeout
+      -TS <seconds>                 Target scan timeout
+      -p <count>                    Deauth packets
+      -TID <essid>                  Target ESSID (for target mode)
+      -MS <count>                   Max scans (for map mode)
+      -MSD <seconds>                Scan duration (for map mode)
+      -GPS <path>                   GPS port (for map mode)
+      -WL <file>                    Wordlist (for process modes)
+    
+    Other:
+      -h, help                      Show this help
+      q, quit                       Exit program
+    
+    Examples:
+      collect -auto -IS 10 -TS 30
+      target -TID "MyNetwork" -IS 5
+      map -MS 50 -MSD 2
+    """
+    print(help_text)
+
+def _execute_interactive_mode(suite, mode_cmd, parsed_args, cli_state):
+    """Execute a mode command in interactive CLI"""
+    # Map command to mode
+    mode_map = {
+        'collect': 'collect',
+        'process': 'process',
+        'target': 'target',
+        'map': 'map',
+        'config': 'config',
+        'clean': 'clean'
+    }
+    
+    if mode_cmd not in mode_map:
+        suite.log(f"Unknown command: {mode_cmd}. Type 'help' for available commands.", prefix="x")
+        return
+    
+    mode_type = mode_map[mode_cmd]
+    
+    # Extract mode subtype (manual/auto)
+    mode_subtype = None
+    if 'manual' in parsed_args or parsed_args.get('m') == True:
+        mode_subtype = 'manual'
+    elif 'auto' in parsed_args or parsed_args.get('a') == True:
+        mode_subtype = 'auto'
+    elif mode_type in ['collect', 'process']:
+        mode_subtype = 'manual'  # Default to manual
+    
+    # Extract parameters
+    initial_scan = int(parsed_args.get('IS', parsed_args.get('initial-scan', suite.initial_scan)))
+    target_scan = int(parsed_args.get('TS', parsed_args.get('target-scan', suite.target_scan)))
+    packets = int(parsed_args.get('p', parsed_args.get('packets', suite.packets)))
+    
+    suite.initial_scan = initial_scan
+    suite.target_scan = target_scan
+    suite.packets = packets
+    
+    suite.log(f"MiFi VERSION 0.1.1", prefix="blank")
+    suite.log(f"MODE: {mode_type}-{mode_subtype if mode_subtype else 'direct'}", prefix="blank")
+    
+    # Print parameters
+    if mode_type in ['collect', 'target']:
+        suite.log(f"{mode_type}-{mode_subtype if mode_subtype else 'direct'} parameters:", prefix="config")
+        suite.log(f"Search:", indent=4, prefix="dot")
+        suite.log(f"Initial scan timeout: {initial_scan} seconds", indent=8, prefix="dot")
+        suite.log(f"Target:", indent=4, prefix="dot")
+        suite.log(f"Target monitor timeout: {target_scan} seconds", indent=8, prefix="dot")
+        suite.log(f"Deauth packets: {packets}", indent=8, prefix="dot")
+    
+    # Execute mode
+    try:
+        if mode_type == "config":
+            suite.configure_interface()
+        
+        elif mode_type == "collect":
+            suite.collect(
+                mode=mode_subtype,
+                packets=packets,
+                target_scan=target_scan,
+                initial_scan=initial_scan
+            )
+        
+        elif mode_type == "process":
+            wordlist = parsed_args.get('WL', parsed_args.get('wordlist', suite.word_list))
+            if wordlist and not os.path.isfile(wordlist):
+                suite.log(f"Wordlist not found: {wordlist}", prefix="x")
+                return
+            suite.word_list = wordlist
+            suite.process_all(mode=mode_subtype, word_list=wordlist)
+        
+        elif mode_type == "target":
+            target_essid = parsed_args.get('TID', parsed_args.get('target-id'))
+            if not target_essid:
+                suite.log("Target ESSID required. Use -TID <essid>", prefix="x")
+                return
+            suite.collect(
+                target_essid=target_essid,
+                target_scan_attempts=int(parsed_args.get('TSA', parsed_args.get('target-search-attempts', 25))),
+                capture_attempts=int(parsed_args.get('TA', parsed_args.get('target-attempts', 10))),
+                packets=packets,
+                target_scan=target_scan,
+                initial_scan=initial_scan
+            )
+        
+        elif mode_type == "map":
+            # Auto-detect GPS device if not provided or if default doesn't exist
+            gps_port = parsed_args.get('GPS', parsed_args.get('gps-port', suite.gps_port))
+            if not gps_port or (gps_port == "/dev/ttyUSB0" and not os.path.exists("/dev/ttyUSB0")):
+                # Try to detect actual GPS device
+                usb_devices = []
+                try:
+                    usb_devices = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
+                    usb_devices = [d for d in usb_devices if d and os.path.exists(d)]
+                    if usb_devices:
+                        gps_port = usb_devices[0]
+                        suite.log(f"Auto-detected GPS device: {gps_port}", indent=4, prefix="check")
+                except Exception:
+                    pass
+            
+            # Use default if still not found
+            if not gps_port:
+                gps_port = "/dev/ttyUSB0"
+            
+            # Use existing GPS if active, otherwise start it
+            if not cli_state.gps_active:
+                if not suite.start_gps_polling(gps_device=gps_port):
+                    suite.log("Cannot proceed without gpsd. Please start gpsd and try again.", prefix="x")
+                    return
+                cli_state.gps_active = True
+            
+            # Use existing TAK if active (always use TAK if connected, regardless of -tak flag)
+            if cli_state.tak_active and suite.tak_connected and suite.tak_socket:
+                suite.log("Using existing TAK connection", prefix="check")
+            elif suite.tak_enabled and suite.tak_connected and suite.tak_socket:
+                suite.log("Using existing TAK connection", prefix="check")
+            elif suite.tak_enabled:
+                suite.log("TAK enabled but not connected. Use 'tak' command to connect.", prefix="warning")
+            
+            max_scans = int(parsed_args.get('MS', parsed_args.get('map-scans', 25)))
+            scan_duration = float(parsed_args.get('MSD', parsed_args.get('map-scan-duration', 1.0)))
+            gps_lock_attempts = int(parsed_args.get('GLA', parsed_args.get('gps-lock-attempts', 20)))
+            gps_lock_wait = int(parsed_args.get('GLW', parsed_args.get('gps-lock-wait', 5)))
+            
+            suite.log(f"{mode_type} parameters:", prefix="config")
+            suite.log(f"Max scans: {max_scans}", indent=4, prefix="dot")
+            suite.log(f"Mapping scan duration: {scan_duration} seconds", indent=4, prefix="dot")
+            suite.log(f"GPS lock attempts: {gps_lock_attempts}", indent=4, prefix="dot")
+            suite.log(f"GPS lock wait: {gps_lock_wait} seconds", indent=4, prefix="dot")
+            suite.log(f"GPS port: {gps_port}", indent=4, prefix="dot")
+            
+            suite.start_signal_tracking(
+                max_attempts=max_scans,
+                scan_interval=scan_duration,
+                gps_lock_attempts=gps_lock_attempts,
+                gps_lock_wait=gps_lock_wait
+            )
+        
+        elif mode_type == "clean":
+            suite.clean()
+        
+    except KeyboardInterrupt:
+        suite.log("Operation cancelled by user", prefix="x")
+        raise
+    except Exception as e:
+        suite.log(f"Error in {mode_type} mode: {e}", prefix="x")
+        if suite.verbose:
+            import traceback
+            traceback.print_exc()
+        raise
+
 if __name__ == "__main__":
-    __version__ = "0.1.1"
+    __version__ = "0.2.0"
 
     parser = argparse.ArgumentParser(
         description="""\
@@ -1478,6 +3624,10 @@ if __name__ == "__main__":
     │                   strengths with GPS for site surveys and heatmaps.  │
     │    • config     → Configures interface for headless operation.       │
     │    • dashboard  → Starts the persistent web dashboard server.        │
+    │    • control    → Starts the web-based control panel with real-time  │
+    │                   status monitoring and operation controls.          │
+    │    • clean      → Removes all log files, clears database, and        │
+    │                   resets interface configuration.                    │
     │                                                                      │
     │  Requirements:                                                       │
     │    • python3 installation                                            │
@@ -1485,7 +3635,7 @@ if __name__ == "__main__":
     │    • aircrack-ng suite (includes airodump-ng, aireplay-ng,           │
     │      aircrack-ng)                                                    │
     │    • John the Ripper Jumbo (for wpapcap2john)                        │
-    │    • rockyou.txt (or specify another file)                           │
+    │    • config/rockyou.txt (or specify another file)                    │
     │                                                                      │
     ├──────────────────────────────────────────────────────────────────────┤
     │  General Usage:                                                      │
@@ -1508,18 +3658,22 @@ if __name__ == "__main__":
     │    collection or processing requirements.                            │
     │                                                                      │
     │  Examples:                                                           │
-    │    sudo ./cli_crack.py --mode collect-manual                         │
+    │    sudo python3 ./mifi.py --mode collect-manual                      │
     │       → Runs collection in manual mode, a good place to start for    │
     │         new users.                                                   │
     │                                                                      │
-    │    sudo ./cli_crack.py --mode full-auto -H                           │
+    │    sudo python3 ./mifi.py --mode full-auto -H                        │
     │       → Runs both collect and process modes in auto sub-mode as a    │
     │         background process. All output available in respective logs  │
     │         for review.                                                  │
     │                                                                      │
-    │    sudo ./cli_crack.py --mode target --TID [essid]                   │
+    │    sudo python3 ./mifi.py --mode target --TID [essid]                │
     │       → Cycles network detection until ESSID is present, then        │
     │         conducts handshake attack until EAPOL is detected.           │
+    │                                                                      │
+    │    sudo python3 ./mifi.py --mode clean                               │
+    │       → Removes all log files, clears the database, and resets       │
+    │         interface configuration in config/config.ini.               │
     │                                                                      │
     │  LEGAL DISCLAIMER:                                                   │
     │    This tool is provided for educational and authorized security     │
@@ -1547,14 +3701,19 @@ if __name__ == "__main__":
     )
     options_group.add_argument(
         "--mode",
-        choices=["config", "collect-manual", "collect-auto", "process-manual", "process-auto", "full-manual", "full-auto", "target", "map", "dashboard"],
-        required=True,
-        help="Specific tool mode for refined behavior and use-case."
+        choices=["config", "collect-manual", "collect-auto", "process-manual", "process-auto", "full-manual", "full-auto", "target", "map", "dashboard", "control", "clean"],
+        required=False,
+        help="Specific tool mode for refined behavior and use-case. If omitted, starts interactive CLI server."
     )
     options_group.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Enable verbose output for subprocess commands. Note this will result in extremely large log files."
+    )
+    options_group.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug mode for detailed debugging output. Useful for troubleshooting issues."
     )
     options_group.add_argument(
         "-H", "--headless",
@@ -1598,9 +3757,9 @@ if __name__ == "__main__":
         "-WL", "--word-list",
         metavar="<WORD_LIST>",
         type=str,
-        default="rockyou.txt",
+        default="config/rockyou.txt",
         required=False,
-        help="Specifies path to custom wordlist. (Default is 'rockyou.txt')"
+        help="Specifies path to custom wordlist. (Default is 'config/rockyou.txt')"
     )
 
     # Target Mode Options
@@ -1616,14 +3775,14 @@ if __name__ == "__main__":
         metavar="<TARGET_SEARCH_ATTEMPTS>",
         type=int,
         default=25,
-        help="Number of target search attempts before giving up. (Default is 25)"
+        help="Number of target search attempts before giving up. Set to 0 for unlimited (Ctrl+C to stop); not allowed in headless mode. (Default is 25)"
     )
     target_group.add_argument(
         "-TA", "--target-attempts",
         metavar="<CAPTURE_ATTEMPTS>",
         type=int,
         default=10,
-        help="Number of deauth attacks to capture an EAPOL handshake before giving up. (Default is 10)"
+        help="Number of deauth attacks to capture an EAPOL handshake before giving up. Set to 0 for unlimited (continues until EAPOL detected or Ctrl+C); not allowed in headless mode. (Default is 10)"
     )
 
     # Map Mode Options
@@ -1634,7 +3793,7 @@ if __name__ == "__main__":
         type=int,
         default=25,
         required=False,
-        help="Total number of spectrum scans. (Default is 50)"
+        help="Total number of spectrum scans. Set to 0 for unlimited (Ctrl+C to stop); not allowed in headless mode. (Default is 25)"
     )
     map_group.add_argument(
         "-MSD", "--map-scan-duration",
@@ -1668,6 +3827,69 @@ if __name__ == "__main__":
         required=False,
         help="Time to wait between GPS fix attempts in seconds (s). (Default is 5)"
     )
+    map_group.add_argument(
+        "-tak", "--tak",
+        action="store_true",
+        required=False,
+        help="Enable TAK server integration to push WiFi network data to TAK server"
+    )
+    map_group.add_argument(
+        "-tak-host", "--tak-host",
+        metavar="<TAK_HOST>",
+        type=str,
+        default=None,
+        required=False,
+        help="TAK server hostname or IP address (required if -tak is used)"
+    )
+    map_group.add_argument(
+        "-tak-port", "--tak-port",
+        metavar="<TAK_PORT>",
+        type=int,
+        default=8087,
+        required=False,
+        help="TAK server port (Default is 8087 for TCP, 8088 for UDP)"
+    )
+    map_group.add_argument(
+        "-tak-protocol", "--tak-protocol",
+        metavar="<TAK_PROTOCOL>",
+        type=str,
+        choices=['tcp', 'udp'],
+        default='tcp',
+        required=False,
+        help="TAK connection protocol: 'tcp' or 'udp' (Default is 'tcp')"
+    )
+    map_group.add_argument(
+        "-tak-cert", "--tak-cert",
+        metavar="<TAK_CERT_FILE>",
+        type=str,
+        default=None,
+        required=False,
+        help="Path to client certificate file for TAK authentication (PEM format)"
+    )
+    map_group.add_argument(
+        "-tak-key", "--tak-key",
+        metavar="<TAK_KEY_FILE>",
+        type=str,
+        default=None,
+        required=False,
+        help="Path to client private key file for TAK authentication (PEM format)"
+    )
+    map_group.add_argument(
+        "-tak-ca", "--tak-ca",
+        metavar="<TAK_CA_FILE>",
+        type=str,
+        default=None,
+        required=False,
+        help="Path to CA certificate file for TAK server verification (PEM format)"
+    )
+    map_group.add_argument(
+        "-tak-token", "--tak-token",
+        metavar="<TAK_API_TOKEN>",
+        type=str,
+        default=None,
+        required=False,
+        help="API token for TAK authentication (alternative to certificates)"
+    )
 
     # Parse known args first to allow -h/--help/--version without requiring --mode
     if any(arg in sys.argv for arg in ['-h', '--help', '--version']):
@@ -1690,6 +3912,14 @@ if __name__ == "__main__":
     # Enforce that --headless is only valid with auto modes
     if args.headless and not args.mode.endswith("-auto"):
         parser.error("--headless is only allowed with '-auto' modes.")
+    # Prevent unlimited attempts in headless mode
+    if args.headless:
+        if hasattr(args, 'target_search_attempts') and args.target_search_attempts == 0:
+            parser.error("Unlimited target search attempts (0) is not allowed in headless mode.")
+        if hasattr(args, 'target_attempts') and args.target_attempts == 0:
+            parser.error("Unlimited capture attempts (0) is not allowed in headless mode.")
+        if hasattr(args, 'map_scans') and args.map_scans == 0:
+            parser.error("Unlimited map scans (0) is not allowed in headless mode.")
     # Remove --target-id requirement for --mode track
     if args.target_id and not args.mode in ["target"]:
         parser.error("--target-id can only be used with 'target' mode.")
@@ -1699,10 +3929,14 @@ if __name__ == "__main__":
     if args.headless and not is_running_under_nohup():
         reexec_with_nohup()
     
-    suite = wifi_cracker()
-    suite.verbose = args.verbose  # Apply global verbose setting
-    suite.headless = args.headless
-
+    # Interactive CLI server mode (no --mode specified)
+    if not args.mode:
+        suite = wifi_cracker()
+        suite.verbose = args.verbose  # Apply global verbose setting
+        suite.debug = args.debug if hasattr(args, 'debug') else False  # Apply debug setting
+        suite.headless = args.headless
+        _run_interactive_cli(suite, __version__)
+        sys.exit(0)
     
     try:
         if '-' in args.mode:
@@ -1710,12 +3944,19 @@ if __name__ == "__main__":
         else:
             mode_type, mode_subtype = args.mode, None
 
-        # Dashboard mode: start the web dashboard
+        # Dashboard mode: start the consolidated dashboard/control panel
+        # Don't create suite instance here - dashboard will create its own
         if mode_type == "dashboard":
             from mifi_dashboard import app
-            print("Starting WiFi Dashboard at http://localhost:5000 ...")
+            print("Starting MiFi Dashboard at http://localhost:5000 ...")
             app.run(debug=True, host="0.0.0.0", port=5000)
             sys.exit(0)
+        
+        # Create suite instance only for non-dashboard modes
+        suite = wifi_cracker()
+        suite.verbose = args.verbose  # Apply global verbose setting
+        suite.debug = args.debug if hasattr(args, 'debug') else False  # Apply debug setting
+        suite.headless = args.headless
 
         # Set wordlist and check only for process or full mode
         if mode_type in ["process", "full"]:
@@ -1723,7 +3964,7 @@ if __name__ == "__main__":
             if not os.path.isfile(suite.word_list):
                 parser.error(f"Wordlist not found at path: {suite.word_list}")
 
-        suite.log(f"CLI CRACKER VERSION {__version__}", prefix="blank")
+        suite.log(f"MiFi VERSION {__version__}", prefix="blank")
         suite.log(f"MODE: {args.mode}", prefix="blank")
 
         suite.initial_config()
@@ -1806,27 +4047,150 @@ if __name__ == "__main__":
             )
         
         elif mode_type == "map":
-            # Start GPS polling (gps3) - pass GPS device for error messages
-            if not suite.start_gps_polling(gps_device=args.gps_port):
-                suite.log("Cannot proceed without gpsd. Please start gpsd and try again.", prefix="x")
-                sys.exit(1)
+            # Auto-detect GPS device if not provided or if default doesn't exist
+            gps_device = args.gps_port if args.gps_port else None
+            if not gps_device or (gps_device == "/dev/ttyUSB0" and not os.path.exists("/dev/ttyUSB0")):
+                # Try to detect actual GPS device
+                usb_devices = []
+                try:
+                    usb_devices = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
+                    usb_devices = [d for d in usb_devices if d and os.path.exists(d)]
+                    if usb_devices:
+                        gps_device = usb_devices[0]
+                        suite.log(f"Auto-detected GPS device: {gps_device}", indent=4, prefix="check")
+                except Exception:
+                    pass
+            
+            # Use default if still not found
+            if not gps_device:
+                gps_device = "/dev/ttyUSB0"
+            
+            # Check if GPS polling is already active (from parent process/dashboard)
+            # GPS should only be controlled by the GPS toggle button, not by individual modes
+            # However, subprocesses need their own GPS polling thread to connect to gpsd
+            gps_started_by_map_mode = False
+            gps_active_from_parent = os.environ.get('MIFI_GPS_ACTIVE', '0') == '1'
+            if suite.gps_thread and suite.gps_thread.is_alive():
+                suite.log("GPS polling already active from parent process - reusing existing connection", indent=4, prefix="check")
+            elif gps_active_from_parent:
+                # GPS is active in parent process - subprocess still needs its own thread to poll gpsd
+                # The parent manages GPS toggle, but subprocess needs to connect to gpsd for data
+                suite.log("GPS is active in parent process - starting GPS polling thread for subprocess", indent=4, prefix="check")
+                if not suite.start_gps_polling(gps_device=gps_device):
+                    suite.log("Cannot proceed without gpsd. Please start gpsd and try again.", prefix="x")
+                    sys.exit(1)
+                gps_started_by_map_mode = True  # Track that we started it, but don't stop it (parent manages it)
+            else:
+                # GPS not active - map mode can't work without GPS
+                suite.log("GPS not active. Please enable GPS via dashboard toggle or CLI 'gps' command first.", prefix="warning")
+                # For CLI compatibility, allow starting GPS if not in dashboard mode
+                # Start GPS polling (gps3) - pass GPS device for error messages
+                if not suite.start_gps_polling(gps_device=gps_device):
+                    suite.log("Cannot proceed without gpsd. Please start gpsd and try again.", prefix="x")
+                    sys.exit(1)
+                gps_started_by_map_mode = True
+            # GPS serial initialization is optional - gps3 handles GPS via gpsd
+            # Only initialize serial if needed (currently not required for map mode)
+            # suite.init_gps() is called but failure is non-fatal since gps3 works via gpsd
+            if not suite.gps_serial:
+                suite.init_gps(port=gps_device)
+                # Don't exit on failure - gps3 via gpsd should work
+            
+            # TAK: Initialize TAK connection if enabled (CLI args override config/config.ini)
+            # TAK should work independently in CLI mode - no dependency on dashboard
+            if args.tak or suite.tak_enabled:
+                # Environment variable not set - TAK will be initialized if enabled
+                # This means TAK is not connected in the dashboard, so map mode needs its own connection
+                # Initialize TAK connection if enabled (CLI args override config/config.ini)
+                # Only initialize if not already connected via environment
+                # CLI arguments override config/config.ini values
+                tak_host = args.tak_host if args.tak_host else suite.tak_host
+                tak_port = args.tak_port if args.tak_port else suite.tak_port
+                tak_protocol = args.tak_protocol if args.tak_protocol else suite.tak_protocol
+                tak_cert = args.tak_cert if args.tak_cert else suite.tak_cert_file
+                tak_key = args.tak_key if args.tak_key else suite.tak_key_file
+                tak_ca = args.tak_ca if args.tak_ca else suite.tak_ca_file
+                tak_token = args.tak_token if args.tak_token else suite.tak_api_token
+                
+                if not tak_host:
+                    suite.log("TAK host required. Configure in config/config.ini [TAK] section or use -tak-host flag.", prefix="x")
+                    sys.exit(1)
+                
+                suite.log("Initializing TAK server connection...", prefix="config")
+                tak_connected = suite.init_tak_connection(
+                    host=tak_host,
+                    port=tak_port,
+                    protocol=tak_protocol,
+                    cert_file=tak_cert,
+                    key_file=tak_key,
+                    ca_file=tak_ca,
+                    api_token=tak_token
+                )
+                
+                if not tak_connected:
+                    suite.log("", prefix="blank")
+                    suite.log("TAK Server connection failed. Troubleshooting steps:", prefix="x")
+                    suite.log("", prefix="blank")
+                    suite.log("1. Verify TAK server is running and accessible:", indent=4, prefix="dot")
+                    suite.log(f"   ping {tak_host}", indent=8, prefix="dot")
+                    suite.log(f"   telnet {tak_host} {tak_port}", indent=8, prefix="dot")
+                    suite.log("", prefix="blank")
+                    suite.log("2. Check network connectivity and firewall rules:", indent=4, prefix="dot")
+                    suite.log(f"   Ensure port {tak_port} is open and accessible", indent=8, prefix="dot")
+                    suite.log("", prefix="blank")
+                    if tak_cert or tak_key:
+                        suite.log("3. Verify certificate files exist and are readable:", indent=4, prefix="dot")
+                        if tak_cert:
+                            suite.log(f"   Certificate: {tak_cert} {'[OK]' if os.path.exists(tak_cert) else '[NOT FOUND]'}", indent=8, prefix="dot")
+                        if tak_key:
+                            suite.log(f"   Private Key: {tak_key} {'[OK]' if os.path.exists(tak_key) else '[NOT FOUND]'}", indent=8, prefix="dot")
+                        if tak_ca:
+                            suite.log(f"   CA Certificate: {tak_ca} {'[OK]' if os.path.exists(tak_ca) else '[NOT FOUND]'}", indent=8, prefix="dot")
+                        suite.log("", prefix="blank")
+                    suite.log("4. Check config/config.ini [TAK] section or CLI arguments:", indent=4, prefix="dot")
+                    suite.log(f"   Host: {tak_host}", indent=8, prefix="dot")
+                    suite.log(f"   Port: {tak_port}", indent=8, prefix="dot")
+                    suite.log(f"   Protocol: {tak_protocol.upper()}", indent=8, prefix="dot")
+                    suite.log("", prefix="blank")
+                    suite.log("5. Review TAK server logs for connection attempts", indent=4, prefix="dot")
+                    suite.log("", prefix="blank")
+                    suite.log("6. Test connection manually:", indent=4, prefix="dot")
+                    suite.log(f"   telnet {tak_host} {tak_port}", indent=8, prefix="dot")
+                    suite.log(f"   # Or use: nc -zv {tak_host} {tak_port}", indent=8, prefix="dot")
+                    suite.log("", prefix="blank")
+                    suite.log("For detailed setup instructions, see: tak/TAK_SERVER_SETUP.md", indent=4, prefix="dot")
+                    suite.log("", prefix="blank")
+                    suite.log("Cannot proceed without TAK connection. Exiting.", prefix="x")
+                    sys.exit(1)
             # Ensure interface is configured
             suite.configure_interface()
             # Start signal mapping
+            # NEVER close TAK connection - TAK is managed by the dashboard toggle
+            # TAK connection should only be closed when the user toggles it off
+            # Map mode should use existing TAK connection, not create/close its own
+            # NEVER stop GPS polling - GPS is managed by the GPS toggle button/dashboard
+            # GPS polling should only start/stop via the GPS toggle, not by individual modes
+            # Map mode should only use existing GPS polling, never stop it
+            # Removed GPS stop logic - GPS is persistent and managed separately
             success = suite.start_signal_tracking(
                 max_attempts=args.map_scans,
                 scan_interval=args.map_scan_duration,
                 gps_lock_attempts=args.gps_lock_attempts,
                 gps_lock_wait=args.gps_lock_wait
             )
-            suite.stop_gps_polling()
+        
+        elif mode_type == "clean":
+            suite.clean_mode()
 
         suite.log(f"Mode: {args.mode} COMPLETE", prefix="blank")
+    except KeyboardInterrupt:
+        if 'suite' in locals():
+            suite.log("", prefix="blank")
+            suite.log("Program interrupted by user (Ctrl+C). Shutting down...", prefix="exited")
+            suite.clean()
+        else:
+            print("\n[!] Program interrupted by user (Ctrl+C). Shutting down...")
+        sys.exit(0)
     finally:
-        suite.clean()
-    
-    """
-    To Do:
-    specific targeted network
-    - dB filtering
-    """
+        if 'suite' in locals():
+            suite.clean()
