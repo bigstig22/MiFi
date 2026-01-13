@@ -41,6 +41,41 @@ print_info() {
     echo -e "${BLUE}[i]${NC} $1"
 }
 
+# Spinner function for long-running operations
+spinner() {
+    local pid=$1
+    local message=$2
+    local spinstr='|/-\'
+    local delay=0.1
+    
+    while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
+        local temp=${spinstr#?}
+        printf "\r${BLUE}[*]${NC} $message ${spinstr:0:1}"
+        spinstr=$temp${spinstr%"$temp"}
+        sleep $delay
+    done
+    printf "\r${GREEN}[*]${NC} $message ${GREEN}✓${NC}\n"
+}
+
+# Progress bar function (for operations with known duration)
+progress_bar() {
+    local current=$1
+    local total=$2
+    local width=50
+    local percentage=$((current * 100 / total))
+    local filled=$((width * current / total))
+    local empty=$((width - filled))
+    
+    printf "\r${BLUE}[*]${NC} Progress: ["
+    printf "%${filled}s" | tr ' ' '='
+    printf "%${empty}s" | tr ' ' '-'
+    printf "] %d%%" "$percentage"
+    
+    if [ $current -eq $total ]; then
+        printf " ${GREEN}✓${NC}\n"
+    fi
+}
+
 # Function to check if command exists
 command_exists() {
     command -v "$1" >/dev/null 2>&1
@@ -134,10 +169,13 @@ install_system_packages() {
                 print_status "All required packages are already installed"
             else
                 print_info "Installing missing packages: ${MISSING_PACKAGES[*]}"
-                sudo apt-get install -y "${MISSING_PACKAGES[@]}" || {
+                (sudo apt-get install -y "${MISSING_PACKAGES[@]}" >/dev/null 2>&1) &
+                spinner $! "Installing system packages"
+                wait $!
+                if [ $? -ne 0 ]; then
                     print_error "Failed to install packages"
                     return 1
-                }
+                fi
             fi
             ;;
         fedora|rhel|centos)
@@ -155,10 +193,13 @@ install_system_packages() {
             
             print_info "Detected: $DISTRO $VERSION"
             print_info "Installing packages..."
-            sudo dnf install -y "${PACKAGES[@]}" || {
+            (sudo dnf install -y "${PACKAGES[@]}" >/dev/null 2>&1) &
+            spinner $! "Installing system packages"
+            wait $!
+            if [ $? -ne 0 ]; then
                 print_error "Failed to install packages"
                 return 1
-            }
+            fi
             ;;
         arch|manjaro)
             PACKAGES=(
@@ -174,10 +215,13 @@ install_system_packages() {
             
             print_info "Detected: $DISTRO"
             print_info "Installing packages..."
-            sudo pacman -S --noconfirm "${PACKAGES[@]}" || {
+            (sudo pacman -S --noconfirm "${PACKAGES[@]}" >/dev/null 2>&1) &
+            spinner $! "Installing system packages"
+            wait $!
+            if [ $? -ne 0 ]; then
                 print_error "Failed to install packages"
                 return 1
-            }
+            fi
             ;;
         *)
             print_warning "Unsupported distribution: $DISTRO"
@@ -376,14 +420,47 @@ install_john_jumbo() {
         return 1
     fi
     
-    print_info "Compiling John the Ripper Jumbo (this may take a few minutes)..."
+    print_info "Compiling John the Ripper Jumbo (this may take 10-30 minutes)..."
     CPU_COUNT=$(nproc 2>/dev/null || echo "4")
-    if ! make -s clean && make -sj$CPU_COUNT >/dev/null 2>&1; then
+    print_info "Using $CPU_COUNT parallel jobs for compilation..."
+    
+    # Clean first (silent is fine)
+    if ! make -s clean >/dev/null 2>&1; then
+        print_warning "make clean had issues, continuing anyway..."
+    fi
+    
+    # Compile with spinner in background
+    print_info "Starting compilation..."
+    (make -j$CPU_COUNT >/tmp/john-compile-$$.log 2>&1) &
+    COMPILE_PID=$!
+    
+    # Show spinner while compiling
+    spinner $COMPILE_PID "Compiling John the Ripper Jumbo"
+    wait $COMPILE_PID
+    COMPILE_EXIT=$?
+    
+    # Check if compilation succeeded
+    if [ $COMPILE_EXIT -ne 0 ]; then
         print_error "Failed to compile John the Ripper Jumbo"
+        print_info "Last 20 lines of compile output:"
+        tail -20 /tmp/john-compile-$$.log 2>/dev/null || echo "No log file found"
         cd "$SCRIPT_DIR"
-        rm -rf "$BUILD_DIR"
+        rm -rf "$BUILD_DIR" /tmp/john-compile-$$.log 2>/dev/null
         return 1
     fi
+    
+    # Verify compilation succeeded by checking for wpapcap2john
+    if [ ! -f "../run/wpapcap2john" ]; then
+        print_error "Compilation completed but wpapcap2john not found"
+        print_info "Checking for wpapcap2john in build directory..."
+        find .. -name "wpapcap2john" -type f 2>/dev/null | head -5
+        cd "$SCRIPT_DIR"
+        rm -rf "$BUILD_DIR" /tmp/john-compile-$$.log 2>/dev/null
+        return 1
+    fi
+    
+    print_status "Compilation completed successfully!"
+    rm -f /tmp/john-compile-$$.log 2>/dev/null
     
     print_info "Installing John the Ripper Jumbo..."
     # Try make install, but also manually copy wpapcap2john if needed
@@ -507,15 +584,44 @@ install_python_packages() {
     fi
     
     print_info "Upgrading pip..."
-    python3 -m pip install --user --upgrade pip || {
-        print_warning "Failed to upgrade pip, continuing anyway..."
+    python3 -m pip install --user --upgrade pip 2>&1 | grep -v "externally-managed-environment" >/dev/null || {
+        # Try with --break-system-packages if --user fails
+        python3 -m pip install --user --upgrade pip --break-system-packages 2>&1 | grep -v "externally-managed-environment" >/dev/null || {
+            print_warning "Failed to upgrade pip, continuing anyway..."
+        }
     }
     
     print_info "Installing Python packages from config/requirements.txt..."
-    python3 -m pip install --user -r config/requirements.txt || {
+    # Try --user first, then fall back to --break-system-packages if needed
+    (python3 -m pip install --user -r config/requirements.txt 2>&1) >/tmp/pip-install-$$.log 2>&1 &
+    PIP_PID=$!
+    spinner $PIP_PID "Installing Python packages"
+    wait $PIP_PID
+    PIP_EXIT=$?
+    
+    # Check if it failed due to externally-managed-environment
+    if [ $PIP_EXIT -ne 0 ] && grep -q "externally-managed-environment" /tmp/pip-install-$$.log 2>/dev/null; then
+        print_warning "User installation blocked by system policy, trying with --break-system-packages flag..."
+        (python3 -m pip install --user -r config/requirements.txt --break-system-packages 2>&1) >/tmp/pip-install-$$.log 2>&1 &
+        PIP_PID=$!
+        spinner $PIP_PID "Installing Python packages (system override)"
+        wait $PIP_PID
+        if [ $? -ne 0 ]; then
+            print_error "Failed to install Python packages"
+            print_info "Installation log:"
+            tail -10 /tmp/pip-install-$$.log 2>/dev/null
+            rm -f /tmp/pip-install-$$.log 2>/dev/null
+            return 1
+        fi
+    elif [ $PIP_EXIT -ne 0 ]; then
         print_error "Failed to install Python packages"
+        print_info "Installation log:"
+        tail -10 /tmp/pip-install-$$.log 2>/dev/null
+        rm -f /tmp/pip-install-$$.log 2>/dev/null
         return 1
-    }
+    fi
+    
+    rm -f /tmp/pip-install-$$.log 2>/dev/null
     
     print_status "Python packages installed successfully"
     return 0
@@ -641,11 +747,17 @@ setup_tak_config() {
         return 0
     fi
     
-    read -p "Do you want to configure TAK Server integration? (y/n): " configure_tak
-    if [[ ! "$configure_tak" =~ ^[Yy]$ ]]; then
-        print_info "Skipping TAK configuration"
-        return 0
-    fi
+    while true; do
+        read -p "Do you want to configure TAK Server integration? (y/n): " configure_tak
+        if [[ "$configure_tak" == "y" ]] || [[ "$configure_tak" == "Y" ]]; then
+            break
+        elif [[ "$configure_tak" == "n" ]] || [[ "$configure_tak" == "N" ]]; then
+            print_info "Skipping TAK configuration"
+            return 0
+        else
+            print_warning "Please enter exactly 'y' or 'n'"
+        fi
+    done
     
     # Read current config
     TAK_ENABLED=$(grep -E "^enabled\s*=" config/config.ini | grep -i "\[TAK\]" -A 10 | grep "^enabled" | cut -d'=' -f2 | tr -d ' ' || echo "false")
