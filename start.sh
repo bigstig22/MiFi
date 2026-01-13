@@ -275,24 +275,65 @@ install_john_jumbo() {
         MISSING_DEPS+=("git")
     fi
     
+    detect_distro
+    case $DISTRO in
+        ubuntu|debian)
+            # Check for additional dependencies needed for John the Ripper
+            if ! pkg-config --exists openssl 2>/dev/null; then
+                MISSING_DEPS+=("libssl-dev")
+            fi
+            if ! pkg-config --exists zlib 2>/dev/null; then
+                MISSING_DEPS+=("zlib1g-dev")
+            fi
+            # Always include build-essential for complete build tools
+            if ! dpkg -l | grep -q "^ii  build-essential "; then
+                MISSING_DEPS+=("build-essential")
+            fi
+            ;;
+        fedora|rhel|centos)
+            # Check for additional dependencies
+            if ! pkg-config --exists openssl 2>/dev/null; then
+                MISSING_DEPS+=("openssl-devel")
+            fi
+            if ! pkg-config --exists zlib 2>/dev/null; then
+                MISSING_DEPS+=("zlib-devel")
+            fi
+            ;;
+        arch|manjaro)
+            # base-devel includes most build tools
+            if ! pkg-config --exists openssl 2>/dev/null; then
+                MISSING_DEPS+=("openssl")
+            fi
+            if ! pkg-config --exists zlib 2>/dev/null; then
+                MISSING_DEPS+=("zlib")
+            fi
+            # Check if base-devel is installed
+            if ! pacman -Q base-devel >/dev/null 2>&1; then
+                MISSING_DEPS+=("base-devel")
+            fi
+            ;;
+    esac
+    
     if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
         print_info "Installing build dependencies: ${MISSING_DEPS[*]}"
-        detect_distro
         case $DISTRO in
             ubuntu|debian)
-                sudo apt-get install -y "${MISSING_DEPS[@]}" build-essential || {
+                sudo apt-get update || {
+                    print_warning "Failed to update package lists, continuing anyway..."
+                }
+                sudo apt-get install -y "${MISSING_DEPS[@]}" || {
                     print_error "Failed to install build dependencies"
                     return 1
                 }
                 ;;
             fedora|rhel|centos)
-                sudo dnf install -y "${MISSING_DEPS[@]}" gcc make || {
+                sudo dnf install -y "${MISSING_DEPS[@]}" || {
                     print_error "Failed to install build dependencies"
                     return 1
                 }
                 ;;
             arch|manjaro)
-                sudo pacman -S --noconfirm "${MISSING_DEPS[@]}" base-devel || {
+                sudo pacman -S --noconfirm "${MISSING_DEPS[@]}" || {
                     print_error "Failed to install build dependencies"
                     return 1
                 }
@@ -320,8 +361,16 @@ install_john_jumbo() {
     cd john-jumbo/src
     
     print_info "Configuring build..."
-    if ! ./configure >/dev/null 2>&1; then
+    CONFIGURE_OUTPUT=$(./configure 2>&1)
+    CONFIGURE_EXIT=$?
+    if [ $CONFIGURE_EXIT -ne 0 ]; then
         print_error "Failed to configure John the Ripper Jumbo"
+        print_info "Configure output:"
+        echo "$CONFIGURE_OUTPUT" | head -20
+        print_info "This may be due to missing dependencies. Common issues:"
+        print_info "  - Missing OpenSSL development headers (libssl-dev on Debian/Ubuntu)"
+        print_info "  - Missing zlib development headers (zlib1g-dev on Debian/Ubuntu)"
+        print_info "  - Missing build-essential package"
         cd "$SCRIPT_DIR"
         rm -rf "$BUILD_DIR"
         return 1
