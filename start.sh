@@ -725,9 +725,9 @@ host =
 port = 8087
 protocol = tcp
 # Certificate-based authentication (leave empty if not using)
-# Files should be in the 'tak' folder, e.g., 'webadmin.p12' or 'tak/webadmin.p12'
+# Files should be in the 'tak' folder, e.g., 'MiFi-Scanner.p12' or 'tak/MiFi-Scanner.p12'
 cert_file = 
-key_file = 
+# CA certificate for server verification (recommended but optional)
 ca_file = 
 # API token authentication (alternative to certificates, leave empty if not using)
 api_token = 
@@ -791,11 +791,28 @@ setup_tak_config() {
     read -p "Use certificate authentication? (y/n) [n]: " use_certs
     if [[ "$use_certs" =~ ^[Yy]$ ]]; then
         echo ""
-        print_info "CERT_FILE: Client certificate file"
-        print_info "  Required extensions: .p12, .pfx (PKCS#12 - contains both cert and key)"
-        print_info "  OR separate files: .crt, .pem, .cer (PEM format certificate)"
-        print_info "  Examples: webadmin.p12, client.crt, certificate.pem"
-        read -p "Enter cert_file filename (will be placed in 'tak' folder) or full path: " cert_file
+        print_info "PKCS#12 Certificate File (.p12) - REQUIRED"
+        print_info "  This file contains both your client certificate and private key"
+        print_info "  File extension must be .p12 or .pfx"
+        print_info "  Example: MiFi-Scanner.p12, lab-field.p12"
+        while true; do
+            read -p "Enter .p12 certificate filename (will be placed in 'tak' folder) or full path: " cert_file
+            if [ -z "$cert_file" ]; then
+                print_warning "Certificate file is required. Please enter a filename."
+                continue
+            fi
+            # Validate it's a .p12 or .pfx file
+            if [[ ! "$cert_file" =~ \.(p12|pfx)$ ]]; then
+                print_warning "Certificate file must have .p12 or .pfx extension"
+                read -p "Continue anyway? (y/n): " continue_anyway
+                if [[ "$continue_anyway" =~ ^[Yy]$ ]]; then
+                    break
+                fi
+            else
+                break
+            fi
+        done
+        
         if [ -n "$cert_file" ]; then
             # If it's not an absolute path, assume it's a filename for the tak folder
             if [[ "$cert_file" != /* ]]; then
@@ -809,28 +826,12 @@ setup_tak_config() {
         fi
         
         echo ""
-        print_info "KEY_FILE: Private key file (only needed if cert_file is NOT .p12/.pfx)"
-        print_info "  Required extensions: .key, .pem (PEM format private key)"
-        print_info "  Note: If cert_file is .p12/.pfx, this can be left empty (key is in cert file)"
-        print_info "  Examples: client.key, private.pem"
-        read -p "Enter key_file filename (optional if using .p12/.pfx, will be placed in 'tak' folder) or full path: " key_file
-        if [ -n "$key_file" ]; then
-            if [[ "$key_file" != /* ]]; then
-                key_path="tak/$key_file"
-                print_info "Private key will be expected at: $key_path"
-            else
-                key_path="$key_file"
-            fi
-            sed -i '/^\[TAK\]/,/^\[/ s|^key_file = .*|key_file = '"$key_file"'|' config/config.ini || \
-            sed -i '/^\[TAK\]/a key_file = '"$key_file"'' config/config.ini
-        fi
-        
-        echo ""
-        print_info "CA_FILE: CA (Certificate Authority) certificate file (optional)"
-        print_info "  Required extensions: .crt, .pem, .cer, .ca (PEM format CA certificate)"
-        print_info "  Used to verify the TAK server's certificate"
-        print_info "  Examples: ca.crt, root.pem, ca-certificate.cer"
-        read -p "Enter ca_file filename (optional, will be placed in 'tak' folder) or full path: " ca_file
+        print_info "CA Certificate File (.pem) - RECOMMENDED"
+        print_info "  Used to verify the TAK server's certificate for secure connections"
+        print_info "  File extension should be .pem, .crt, or .cer"
+        print_info "  Example: ca.pem, root.pem"
+        print_info "  Note: This is optional but recommended for production use"
+        read -p "Enter CA certificate filename (optional, will be placed in 'tak' folder) or full path (press Enter to skip): " ca_file
         if [ -n "$ca_file" ]; then
             if [[ "$ca_file" != /* ]]; then
                 ca_path="tak/$ca_file"
@@ -840,6 +841,8 @@ setup_tak_config() {
             fi
             sed -i '/^\[TAK\]/,/^\[/ s|^ca_file = .*|ca_file = '"$ca_file"'|' config/config.ini || \
             sed -i '/^\[TAK\]/a ca_file = '"$ca_file"'' config/config.ini
+        else
+            print_info "Skipping CA certificate (server verification will be disabled)"
         fi
     else
         read -p "Use API token authentication? (y/n) [n]: " use_token
