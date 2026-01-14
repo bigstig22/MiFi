@@ -109,6 +109,15 @@ create_directories() {
 create_database() {
     print_status "Creating database file..."
     
+    # Ensure we're in the script directory
+    cd "$SCRIPT_DIR"
+    
+    # Ensure config directory exists
+    if [ ! -d "config" ]; then
+        mkdir -p "config"
+        print_info "Created config directory"
+    fi
+    
     DB_FILE="config/networks.db"
     
     if [ ! -f "$DB_FILE" ]; then
@@ -592,31 +601,63 @@ install_python_packages() {
     }
     
     print_info "Installing Python packages from config/requirements.txt..."
-    # Try --user first, then fall back to --break-system-packages if needed
+    
+    # Install packages that require --break-system-packages separately
+    # gps3 and flask-cors specifically need this flag on some systems
+    CRITICAL_PACKAGES=("gps3>=0.33.3" "flask-cors>=4.0.0")
+    OTHER_PACKAGES=("flask>=2.0.0" "tabulate>=0.9.0" "pyserial>=3.5")
+    
+    # First, try installing all packages with --user
     (python3 -m pip install --user -r config/requirements.txt 2>&1) >/tmp/pip-install-$$.log 2>&1 &
     PIP_PID=$!
     spinner $PIP_PID "Installing Python packages"
     wait $PIP_PID
     PIP_EXIT=$?
     
-    # Check if it failed due to externally-managed-environment
+    # If failed due to externally-managed-environment, use --break-system-packages for all
     if [ $PIP_EXIT -ne 0 ] && grep -q "externally-managed-environment" /tmp/pip-install-$$.log 2>/dev/null; then
-        print_warning "User installation blocked by system policy, trying with --break-system-packages flag..."
+        print_warning "User installation blocked, trying with --break-system-packages flag..."
         (python3 -m pip install --user -r config/requirements.txt --break-system-packages 2>&1) >/tmp/pip-install-$$.log 2>&1 &
         PIP_PID=$!
         spinner $PIP_PID "Installing Python packages (system override)"
         wait $PIP_PID
+        PIP_EXIT=$?
+    fi
+    
+    # Verify and install critical packages (gps3, flask-cors) with --break-system-packages if needed
+    print_info "Verifying critical packages (gps3, flask-cors)..."
+    
+    # Check gps3
+    if ! python3 -c "import gps3" 2>/dev/null; then
+        print_info "Installing gps3 with --break-system-packages..."
+        (python3 -m pip install --user gps3>=0.33.3 --break-system-packages 2>&1) >/tmp/pip-install-$$.log 2>&1 &
+        PIP_PID=$!
+        spinner $PIP_PID "Installing gps3"
+        wait $PIP_PID
         if [ $? -ne 0 ]; then
-            print_error "Failed to install Python packages"
-            print_info "Installation log:"
-            tail -10 /tmp/pip-install-$$.log 2>/dev/null
-            rm -f /tmp/pip-install-$$.log 2>/dev/null
-            return 1
+            print_warning "Failed to install gps3, but continuing..."
+            tail -3 /tmp/pip-install-$$.log 2>/dev/null
         fi
-    elif [ $PIP_EXIT -ne 0 ]; then
-        print_error "Failed to install Python packages"
+    fi
+    
+    # Check flask-cors (imports as flask_cors)
+    if ! python3 -c "import flask_cors" 2>/dev/null; then
+        print_info "Installing flask-cors with --break-system-packages..."
+        (python3 -m pip install --user flask-cors>=4.0.0 --break-system-packages 2>&1) >/tmp/pip-install-$$.log 2>&1 &
+        PIP_PID=$!
+        spinner $PIP_PID "Installing flask-cors"
+        wait $PIP_PID
+        if [ $? -ne 0 ]; then
+            print_warning "Failed to install flask-cors, but continuing..."
+            tail -3 /tmp/pip-install-$$.log 2>/dev/null
+        fi
+    fi
+    
+    # Final check - verify all packages are installed
+    if [ $PIP_EXIT -ne 0 ]; then
+        print_error "Failed to install some Python packages"
         print_info "Installation log:"
-        tail -10 /tmp/pip-install-$$.log 2>/dev/null
+        tail -15 /tmp/pip-install-$$.log 2>/dev/null
         rm -f /tmp/pip-install-$$.log 2>/dev/null
         return 1
     fi
@@ -630,6 +671,15 @@ install_python_packages() {
 # Function to download rockyou.txt
 download_rockyou() {
     print_status "Checking for rockyou.txt wordlist..."
+    
+    # Ensure we're in the script directory
+    cd "$SCRIPT_DIR"
+    
+    # Ensure config directory exists
+    if [ ! -d "config" ]; then
+        mkdir -p "config"
+        print_info "Created config directory"
+    fi
     
     if [ -f "config/rockyou.txt" ]; then
         print_info "config/rockyou.txt already exists"
@@ -707,6 +757,15 @@ setup_gps() {
 create_config() {
     print_status "Checking configuration file..."
     
+    # Ensure we're in the script directory
+    cd "$SCRIPT_DIR"
+    
+    # Ensure config directory exists
+    if [ ! -d "config" ]; then
+        mkdir -p "config"
+        print_info "Created config directory"
+    fi
+    
     if [ ! -f "config/config.ini" ]; then
         print_info "Creating default config/config.ini..."
         cat > config/config.ini << 'EOF'
@@ -770,21 +829,21 @@ setup_tak_config() {
     # Get TAK host
     read -p "Enter TAK Server hostname or IP address: " tak_host
     if [ -n "$tak_host" ]; then
-        sed -i '/^\[TAK\]/,/^\[/ s/^host = .*/host = '"$tak_host"'/' config.ini || \
-        sed -i '/^\[TAK\]/a host = '"$tak_host"'' config.ini
+        sed -i '/^\[TAK\]/,/^\[/ s/^host = .*/host = '"$tak_host"'/' config/config.ini || \
+        sed -i '/^\[TAK\]/a host = '"$tak_host"'' config/config.ini
     fi
     
     # Get TAK port
     read -p "Enter TAK Server Streaming port [8087]: " tak_port
     tak_port=${tak_port:-8087}
-    sed -i '/^\[TAK\]/,/^\[/ s/^port = .*/port = '"$tak_port"'/' config.ini || \
-    sed -i '/^\[TAK\]/a port = '"$tak_port"'' config.ini
+    sed -i '/^\[TAK\]/,/^\[/ s/^port = .*/port = '"$tak_port"'/' config/config.ini || \
+    sed -i '/^\[TAK\]/a port = '"$tak_port"'' config/config.ini
     
     # Get protocol
     read -p "Enter protocol (tcp/udp) [tcp]: " tak_protocol
     tak_protocol=${tak_protocol:-tcp}
-    sed -i '/^\[TAK\]/,/^\[/ s/^protocol = .*/protocol = '"$tak_protocol"'/' config.ini || \
-    sed -i '/^\[TAK\]/a protocol = '"$tak_protocol"'' config.ini
+    sed -i '/^\[TAK\]/,/^\[/ s/^protocol = .*/protocol = '"$tak_protocol"'/' config/config.ini || \
+    sed -i '/^\[TAK\]/a protocol = '"$tak_protocol"'' config/config.ini
     
     # Ask about authentication
     print_info "Certificate files should be placed in the 'tak' folder"
