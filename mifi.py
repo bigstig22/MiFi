@@ -162,6 +162,9 @@ class wifi_cracker:
         Prompts user only if none match.
         """
         self.log("Configuring interface...", prefix="config")
+        
+        # First, check for and recover any stuck interfaces
+        self._recover_stuck_interfaces()
 
         config = configparser.ConfigParser()
         config.read("config/config.ini")
@@ -345,7 +348,81 @@ class wifi_cracker:
                     return iface
         except subprocess.CalledProcessError:
             self.log("Failed to run 'iw dev'", prefix="error")
-        return None 
+        return None
+    
+    def _recover_stuck_interfaces(self):
+        """
+        Checks for interfaces that are stuck in down state and attempts to recover them.
+        This helps recover from situations where the interface was left in a bad state.
+        """
+        try:
+            # Get all interfaces
+            all_interfaces = self._get_interfaces()
+            
+            for iface in all_interfaces:
+                # Check if interface is down
+                try:
+                    result = self.coms(['ip', 'link', 'show', iface], capture_output=True, check=False)
+                    if result.returncode == 0 and 'state DOWN' in result.stdout:
+                        # Try to bring it up
+                        try:
+                            self.coms(['ip', 'link', 'set', iface, 'up'], check=False)
+                            if self.verbose:
+                                self.log(f"Recovered stuck interface {iface} (brought up)", indent=4, prefix="check")
+                        except Exception:
+                            pass  # Non-critical
+                except Exception:
+                    pass  # Non-critical
+        except Exception:
+            pass  # Non-critical - recovery is best effort
+    
+    def _ensure_interface_up(self):
+        """
+        Ensures the interface is up (not in DOWN state) without changing monitor mode.
+        This is a safe operation that only brings up interfaces that are down.
+        Does NOT stop monitor mode - interface remains in monitor mode between executions.
+        """
+        if not self.interface:
+            return
+        
+        try:
+            # Check if the current monitor interface is up
+            monitor_iface = self._find_monitor_interface()
+            if monitor_iface:
+                # Check if monitor interface is down
+                try:
+                    result = self.coms(['ip', 'link', 'show', monitor_iface], capture_output=True, check=False)
+                    if result.returncode == 0 and 'state DOWN' in result.stdout:
+                        # Bring it up (safe operation, doesn't change monitor mode)
+                        try:
+                            self.coms(['ip', 'link', 'set', monitor_iface, 'up'], check=False)
+                            if self.verbose:
+                                self.log(f"Brought monitor interface {monitor_iface} up", indent=4, prefix="check")
+                        except Exception:
+                            pass  # Non-critical
+                except Exception:
+                    pass  # Non-critical
+            
+            # Also check the base interface if it exists
+            base_iface = self.interface.replace('mon', '') if self.interface.endswith('mon') else self.interface
+            if base_iface != monitor_iface:
+                try:
+                    result = self.coms(['ip', 'link', 'show', base_iface], capture_output=True, check=False)
+                    if result.returncode == 0 and 'state DOWN' in result.stdout:
+                        # Bring it up (safe operation)
+                        try:
+                            self.coms(['ip', 'link', 'set', base_iface, 'up'], check=False)
+                            if self.verbose:
+                                self.log(f"Brought base interface {base_iface} up", indent=4, prefix="check")
+                        except Exception:
+                            pass  # Non-critical
+                except Exception:
+                    pass  # Non-critical
+                
+        except Exception as e:
+            # Non-critical - log but don't fail
+            if self.verbose:
+                self.log(f"Interface check note: {e}", indent=4, prefix="dash") 
 
     def _update_config(self, new_iface):
         """Adds a new monitor-mode interface to config/config.ini under monitor_candidates."""
@@ -2184,10 +2261,15 @@ class wifi_cracker:
         except KeyboardInterrupt:
             self.log("Signal tracking stopped by user", prefix="exited")
             self.tracking_active = False
+            # Ensure interface is up (but keep it in monitor mode)
+            self._ensure_interface_up()
             raise
         
         self.tracking_active = False
-        self.clean()
+        # Do NOT call clean() here - that should only run on explicit clean mode
+        # Do NOT stop monitor mode - interface should remain in monitor mode between executions
+        # Just ensure the interface is up (not in DOWN state)
+        self._ensure_interface_up()
         return True
 
     def record_signal_data(self, essid, bssid, channel, signal_strength, gps_data, session_id):

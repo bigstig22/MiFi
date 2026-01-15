@@ -1155,6 +1155,19 @@ def api_start():
                     import traceback
                     traceback.print_exc()
                 finally:
+                    # Ensure interface is up (but keep it in monitor mode between executions)
+                    try:
+                        if mifi_service:
+                            mifi_service._ensure_interface_up()
+                    except Exception as e:
+                        error_log = {
+                            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                            'message': f'Interface check note: {e}',
+                            'level': 'warning',
+                            'prefix': '[!]'
+                        }
+                        mifi_log_queue.put(error_log)
+                    
                     # Clear log callback when done
                     if mifi_service:
                         mifi_service.log_callback = None
@@ -1327,6 +1340,12 @@ def api_stop():
                 mifi_service.tracking_active = False
                 # Wait a moment for the loop to check the flag
                 time.sleep(0.5)
+                # Ensure interface is up (but keep it in monitor mode between executions)
+                try:
+                    mifi_service._ensure_interface_up()
+                except Exception as e:
+                    # Log but don't fail - interface check is best effort
+                    print(f"[WARNING] Interface check note: {e}")
             
             mifi_status['running'] = False
             mifi_status['mode'] = None
