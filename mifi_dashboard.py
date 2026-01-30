@@ -2749,14 +2749,22 @@ def get_data():
         query += ' AND session_id = ?'
         params.append(session_id)
     if essid:
-        query += ' AND essid = ?'
-        params.append(essid)
+        # Support multiple ESSIDs (comma-separated)
+        essid_list = [e.strip() for e in essid.split(',') if e.strip()]
+        if essid_list:
+            placeholders = ','.join(['?'] * len(essid_list))
+            query += f' AND essid IN ({placeholders})'
+            params.extend(essid_list)
     elif essid_search:
         query += ' AND essid LIKE ?'
         params.append(f'%{essid_search}%')
     if bssid:
-        query += ' AND bssid = ?'
-        params.append(bssid)
+        # Support multiple BSSIDs (comma-separated)
+        bssid_list = [b.strip() for b in bssid.split(',') if b.strip()]
+        if bssid_list:
+            placeholders = ','.join(['?'] * len(bssid_list))
+            query += f' AND bssid IN ({placeholders})'
+            params.extend(bssid_list)
     elif bssid_search:
         query += ' AND bssid LIKE ?'
         params.append(f'%{bssid_search}%')
@@ -3192,7 +3200,7 @@ def dashboard():
             background-color: rgba(0, 102, 255, 0.15);
         }
         .legend {
-            position: fixed;
+            position: absolute;
             bottom: 30px;
             right: 30px;
             background: var(--bg-secondary);
@@ -3202,8 +3210,11 @@ def dashboard():
             z-index: 1000;
             min-width: 200px;
             display: none;
-            cursor: move;
+            cursor: default;
             user-select: none;
+            max-width: calc(100% - 60px);
+            max-height: calc(100% - 60px);
+            overflow-y: auto;
         }
         .legend.visible {
             display: block;
@@ -3220,6 +3231,7 @@ def dashboard():
             padding-bottom: 8px;
             border-bottom: 1px solid var(--border-color);
             cursor: move;
+            user-select: none;
         }
         .legend-drag-handle {
             color: var(--text-muted);
@@ -3468,13 +3480,15 @@ def dashboard():
         }
         .marker-label {
             background: rgba(255, 255, 255, 0.9);
-            border: 1px solid #000;
+            border: 2px solid #000;
             border-radius: 4px;
             padding: 2px 6px;
             font-size: 0.75em;
-            font-weight: 500;
+            font-weight: bold;
             pointer-events: none;
             text-shadow: 1px 1px 1px rgba(255,255,255,0.8);
+            -webkit-text-stroke: 0.5px #000;
+            text-stroke: 0.5px #000;
         }
         .stats-panel {
             display: flex;
@@ -3630,27 +3644,21 @@ def dashboard():
                     <div class="advanced-filter-group">
                         <label>ESSID Filter</label>
                         <div class="filter-item">
-                            <div class="search-input-wrapper">
-                                <input type="search" id="essidSearch" placeholder="Search ESSID..." title="Search ESSID (partial match)">
-                            </div>
-                        </div>
-                        <div class="filter-item">
-                            <select id="essidSelect" title="Filter by ESSID (exact match)">
+                            <select id="essidSelect" multiple size="5" title="Select one or more ESSIDs (hold Ctrl/Cmd to select multiple)">
                                 <option value="">All ESSIDs</option>
                             </select>
+                            <button type="button" onclick="toggleSelectAll('essidSelect')" class="secondary" style="margin-top: 4px; padding: 4px 8px; font-size: 0.8em; width: 100%;">Select All</button>
+                            <small style="display: block; margin-top: 4px; color: #666; font-size: 11px;">Hold Ctrl/Cmd to select multiple</small>
                         </div>
                     </div>
                     <div class="advanced-filter-group">
                         <label>BSSID Filter</label>
                         <div class="filter-item">
-                            <div class="search-input-wrapper">
-                                <input type="search" id="bssidSearch" placeholder="Search BSSID..." title="Search BSSID (partial match)">
-                            </div>
-                        </div>
-                        <div class="filter-item">
-                            <select id="bssidSelect" title="Filter by BSSID (exact match)">
+                            <select id="bssidSelect" multiple size="5" title="Select one or more BSSIDs (hold Ctrl/Cmd to select multiple)">
                                 <option value="">All BSSIDs</option>
                             </select>
+                            <button type="button" onclick="toggleSelectAll('bssidSelect')" class="secondary" style="margin-top: 4px; padding: 4px 8px; font-size: 0.8em; width: 100%;">Select All</button>
+                            <small style="display: block; margin-top: 4px; color: #666; font-size: 11px;">Hold Ctrl/Cmd to select multiple</small>
                         </div>
                     </div>
                     <div class="advanced-filter-group">
@@ -3731,6 +3739,28 @@ def dashboard():
     <div id="contextMenu" class="context-menu"></div>
     <div id="map-container">
         <div id="map"></div>
+        <div id="legend" class="legend">
+            <div class="legend-header">
+                <span class="legend-drag-handle" title="Drag to move">☰</span>
+                <div class="legend-title">Signal Strength (dBm)</div>
+            </div>
+            <div id="legendContent"></div>
+            <div id="heatmapControls" style="display: none; margin-top: 10px; padding-top: 10px; border-top: 1px solid #ddd;">
+                <label style="display: block; margin-bottom: 5px; font-size: 12px; font-weight: bold;">Transparency:</label>
+                <input type="range" id="heatmapTransparency" min="0.1" max="1.0" step="0.1" value="0.9" style="width: 100%;">
+                <div style="display: flex; justify-content: space-between; font-size: 10px; color: #666; margin-top: 2px;">
+                    <span>Transparent</span>
+                    <span id="transparencyValue">90%</span>
+                    <span>Opaque</span>
+                </div>
+            </div>
+            <div class="color-editor" id="colorEditor" style="display:none;">
+                <div class="color-editor-title">Custom Color Thresholds</div>
+                <div id="colorThresholds"></div>
+                <button class="add-threshold-btn secondary" onclick="addColorThreshold()">+ Add Threshold</button>
+            </div>
+            <button onclick="toggleColorEditor()" class="secondary" style="margin-top:8px;width:100%;font-size:0.85em;">Edit Colors</button>
+        </div>
         <div id="data-table-panel">
             <div class="data-table-header" onclick="toggleDataTable()">
                 <span class="data-table-title">Data Table</span>
@@ -3755,19 +3785,6 @@ def dashboard():
                 </table>
             </div>
         </div>
-    </div>
-    <div id="legend" class="legend">
-        <div class="legend-header">
-            <span class="legend-drag-handle" title="Drag to move">☰</span>
-            <div class="legend-title">Signal Strength (dBm)</div>
-        </div>
-        <div id="legendContent"></div>
-        <div class="color-editor" id="colorEditor" style="display:none;">
-            <div class="color-editor-title">Custom Color Thresholds</div>
-            <div id="colorThresholds"></div>
-            <button class="add-threshold-btn secondary" onclick="addColorThreshold()">+ Add Threshold</button>
-        </div>
-        <button onclick="toggleColorEditor()" class="secondary" style="margin-top:8px;width:100%;font-size:0.85em;">Edit Colors</button>
     </div>
     <script>
         // Prevent redeclaration errors - check if already initialized
@@ -4044,56 +4061,49 @@ def dashboard():
             let reasons = [];
             let warnings = [];
             
-            // 1. Sample size check (0-40 points)
+            // 1. Sample size check (0-35 points) - Primary factor for confidence
             const minReadings = 3;
             const idealReadings = 5;
+            const excellentReadings = 10;
             if (readings.length < minReadings) {
                 reasons.push(`Insufficient readings (${readings.length} < ${minReadings} minimum)`);
                 return { score: 0, reasons: reasons, warnings: warnings, pass: false };
             }
-            if (readings.length >= idealReadings) {
-                score += 40;
+            if (readings.length >= excellentReadings) {
+                score += 35;
+                reasons.push(`Excellent sample size (${readings.length} readings)`);
+            } else if (readings.length >= idealReadings) {
+                score += 30;
                 reasons.push(`Good sample size (${readings.length} readings)`);
             } else {
-                score += (readings.length / idealReadings) * 40;
+                score += (readings.length / idealReadings) * 30;
                 reasons.push(`Adequate sample size (${readings.length} readings)`);
             }
             
-            // 2. Signal strength validation (0-25 points)
-            // US WiFi regulations: Consumer routers typically 15-20 dBm (32-100 mW)
-            // Expected received signals: -30 to -90 dBm (depending on distance and environment)
-            // At 1m: ~-30 dBm, At 10m: ~-50 dBm, At 100m: ~-70 dBm (free space)
+            // 2. Signal variance check (0-30 points) - Primary factor for confidence
+            // Higher variance indicates better triangulation data
             const signals = readings.map(r => r.signal);
-            const minSignal = Math.min(...signals);
-            const maxSignal = Math.max(...signals);
             const avgSignal = signals.reduce((a, b) => a + b, 0) / signals.length;
-            
-            // Check if signals are in reasonable range for US WiFi
-            if (avgSignal < -90) {
-                warnings.push('Very weak signals - may be too far or obstructed');
-                score += 5;
-            } else if (avgSignal > -25) {
-                warnings.push('Very strong signals - may be unrealistic or very close (<1m)');
-                score += 10;
-            } else if (avgSignal >= -70 && avgSignal <= -40) {
-                score += 25; // Ideal range for typical distances (10-100m)
-                reasons.push(`Good signal strength range (avg: ${avgSignal.toFixed(1)} dBm)`);
-            } else {
-                score += 15;
-                reasons.push(`Acceptable signal strength (avg: ${avgSignal.toFixed(1)} dBm)`);
-            }
-            
-            // Check signal variance (should have some variation)
             const signalVariance = signals.reduce((sum, s) => sum + Math.pow(s - avgSignal, 2), 0) / signals.length;
-            if (signalVariance < 10) {
-                warnings.push('Low signal variance - readings may be too close together');
-                score -= 5;
+            const signalStdDev = Math.sqrt(signalVariance);
+            
+            // Signal variance scoring: more variance = better (indicates movement/spread)
+            if (signalStdDev >= 15) {
+                score += 30; // Excellent variance - good spread of signal strengths
+                reasons.push(`Excellent signal variance (std dev: ${signalStdDev.toFixed(1)} dBm)`);
+            } else if (signalStdDev >= 10) {
+                score += 25; // Good variance
+                reasons.push(`Good signal variance (std dev: ${signalStdDev.toFixed(1)} dBm)`);
+            } else if (signalStdDev >= 5) {
+                score += 15; // Adequate variance
+                reasons.push(`Adequate signal variance (std dev: ${signalStdDev.toFixed(1)} dBm)`);
             } else {
-                score += 5;
+                warnings.push('Low signal variance - readings may be too close together');
+                score += 5; // Low variance - readings too similar
             }
             
-            // 3. Spatial distribution check (0-20 points)
-            // Check if readings are spread out (not all in same location)
+            // 3. Location variance check (0-35 points) - Primary factor for confidence
+            // Higher spatial spread indicates better triangulation
             const lats = readings.map(r => r.lat);
             const lons = readings.map(r => r.lon);
             const latRange = Math.max(...lats) - Math.min(...lats);
@@ -4104,18 +4114,26 @@ def dashboard():
             const lonRangeMeters = lonRange * 111000 * Math.cos((Math.max(...lats) + Math.min(...lats)) / 2 * Math.PI / 180);
             const maxRange = Math.max(latRangeMeters, lonRangeMeters);
             
-            if (maxRange < 5) {
-                warnings.push('Readings too close together - poor spatial distribution');
-                score += 5;
-            } else if (maxRange >= 20 && maxRange <= 100) {
-                score += 20;
+            // Location variance scoring: optimal range is 20-100m for good triangulation
+            if (maxRange >= 20 && maxRange <= 100) {
+                score += 35; // Excellent spatial distribution for triangulation
+                reasons.push(`Excellent spatial distribution (${maxRange.toFixed(0)}m spread)`);
+            } else if (maxRange >= 10 && maxRange < 20) {
+                score += 25; // Good but could be better
                 reasons.push(`Good spatial distribution (${maxRange.toFixed(0)}m spread)`);
-            } else if (maxRange > 100) {
+            } else if (maxRange >= 5 && maxRange < 10) {
+                score += 15; // Adequate
+                reasons.push(`Adequate spatial distribution (${maxRange.toFixed(0)}m spread)`);
+            } else if (maxRange > 100 && maxRange <= 500) {
+                score += 20; // Very spread out but still usable
+                warnings.push('Readings far apart - may affect accuracy');
+                reasons.push(`Wide spatial distribution (${maxRange.toFixed(0)}m spread)`);
+            } else if (maxRange > 500) {
                 warnings.push('Readings very far apart - may be different access points');
                 score += 10;
             } else {
-                score += 10;
-                reasons.push(`Adequate spatial distribution (${maxRange.toFixed(0)}m spread)`);
+                warnings.push('Readings too close together - poor spatial distribution');
+                score += 5; // Too close - poor triangulation
             }
             
             // 4. Distance validation (0-15 points)
@@ -4247,16 +4265,32 @@ def dashboard():
             const r2 = p2.distance;
             const r3 = p3.distance;
             
-            // Trilateration calculation
-            // Using the method of intersecting circles
-            const A = 2 * (x3 - x2);
-            const B = 2 * (y3 - y2);
-            const C = r2 * r2 - r1 * r1 - x2 * x2 - y2 * y2;
-            const D = r3 * r3 - r1 * r1 - x3 * x3 - y3 * y3;
+            // Trilateration calculation using intersecting circles
+            // Since p1 is at origin (0,0), we have:
+            // Circle 1: x² + y² = r1²
+            // Circle 2: (x-x2)² + (y-y2)² = r2²
+            // Circle 3: (x-x3)² + (y-y3)² = r3²
+            //
+            // Subtracting circle 1 from circle 2:
+            // (x-x2)² + (y-y2)² - (x² + y²) = r2² - r1²
+            // x² - 2x2*x + x2² + y² - 2y2*y + y2² - x² - y² = r2² - r1²
+            // -2x2*x - 2y2*y = r2² - r1² - x2² - y2²
+            // x2*x + y2*y = (r1² - r2² + x2² + y2²) / 2
+            //
+            // Similarly for circle 3:
+            // x3*x + y3*y = (r1² - r3² + x3² + y3²) / 2
             
-            const denominator = A * y2 - B * x2;
+            const A = x2;
+            const B = y2;
+            const C = (r1 * r1 - r2 * r2 + x2 * x2 + y2 * y2) / 2;
+            const D = x3;
+            const E = y3;
+            const F = (r1 * r1 - r3 * r3 + x3 * x3 + y3 * y3) / 2;
+            
+            // Solve system: A*x + B*y = C, D*x + E*y = F
+            const denominator = A * E - B * D;
             if (Math.abs(denominator) < 1e-10) {
-                // Points are collinear, fall back to weighted centroid
+                // Circles are collinear, fall back to weighted centroid
                 let totalWeight = 0;
                 let weightedLat = 0;
                 let weightedLon = 0;
@@ -4273,8 +4307,8 @@ def dashboard():
                 };
             }
             
-            const x = (C * y2 - D * y2) / denominator;
-            const y = (D * x2 - C * x2) / denominator;
+            const x = (C * E - B * F) / denominator;
+            const y = (A * F - C * D) / denominator;
             
             // Convert back to lat/lon
             const distance = Math.sqrt(x * x + y * y);
@@ -4454,22 +4488,27 @@ def dashboard():
                 const gpsPlotCount = Object.keys(gpsGroups).length;
                 updateStatusBadge(`${gpsPlotCount} GPS Plots | ${totalNetworks} Networks`, 'success');
             } else if (mode === 'heatmap') {
-                // Group readings by BSSID to estimate source locations
-                bssidGroups = {};
+                // Group readings by network (ESSID+BSSID combination) to estimate source locations
+                // This allows filtering by ESSID/BSSID like other modes
+                let networkGroups = {};
                 filtered.forEach(point => {
-                    if (!point.bssid) return;
-                    if (!bssidGroups[point.bssid]) {
-                        bssidGroups[point.bssid] = [];
+                    // Use ESSID+BSSID as key, or just BSSID if ESSID is missing
+                    let networkKey = point.bssid ? 
+                        ((point.essid || 'Unknown') + '|' + point.bssid) : 
+                        (point.essid || 'Unknown');
+                    
+                    if (!networkGroups[networkKey]) {
+                        networkGroups[networkKey] = [];
                     }
-                    bssidGroups[point.bssid].push(point);
+                    networkGroups[networkKey].push(point);
                 });
                 
-                // Estimate source location for each BSSID using trilateration
-                let heatData = [];
+                // Estimate source location for each network using trilateration
+                heatData = []; // Use global variable
                 estimatedSources = []; // Reset for this plot
                 
-                Object.keys(bssidGroups).forEach(bssid => {
-                    let readings = bssidGroups[bssid];
+                Object.keys(networkGroups).forEach(networkKey => {
+                    let readings = networkGroups[networkKey];
                     
                     // Calculate confidence score
                     let confidence = calculateConfidence(readings);
@@ -4483,16 +4522,17 @@ def dashboard():
                     // Estimate source location using trilateration
                     let estimated = estimateSourceLocation(readings);
                     if (estimated) {
-                        // Calculate intensity based on confidence score and signal strengths
-                        let avgSignal = readings.reduce((sum, p) => sum + p.signal, 0) / readings.length;
-                        let intensity = (confidence.score / 100) * signalToHeat(avgSignal) * Math.min(1, readings.length / 10);
+                        // Use confidence score (0-100) normalized to 0-1 for heatmap intensity
+                        // Higher confidence = higher intensity (brighter color)
+                        // The actual color will be determined by the gradient based on confidence
+                        let intensity = confidence.score / 100;
                         
-                        // Only add if intensity is meaningful
-                        if (intensity > 0.1) {
+                        // Only add if intensity is meaningful (confidence >= 10%)
+                        if (intensity >= 0.1) {
                             heatData.push([estimated.lat, estimated.lon, intensity]);
                             estimatedSources.push({
-                                bssid: bssid,
-                                essid: readings[0].essid,
+                                bssid: readings[0].bssid || 'N/A',
+                                essid: readings[0].essid || 'Unknown',
                                 lat: estimated.lat,
                                 lon: estimated.lon,
                                 confidence: confidence.score >= 75 ? 'high' : (confidence.score >= 50 ? 'medium' : 'low'),
@@ -4512,21 +4552,44 @@ def dashboard():
                     // Create transparent heatmap layer (not markers)
                     // Check if leaflet.heat is available
                     if (typeof L.heatLayer === 'function') {
+                        // Get transparency from slider (default 0.9 = 90% opacity)
+                        // Lower value = more transparent, higher = more opaque
+                        let transparency = parseFloat(document.getElementById('heatmapTransparency')?.value || '0.9');
+                        // Remove existing heat layer if present
+                        if (heatLayer) {
+                            map.removeLayer(heatLayer);
+                        }
+                        // Gradient colors represent confidence levels:
+                        // Blue (low confidence) -> Cyan -> Green -> Yellow -> Orange -> Red (high confidence)
+                        // Use fixed minOpacity for color intensity, apply CSS opacity for transparency
                         heatLayer = L.heatLayer(heatData, {
                             radius: 40,
                             blur: 30,
                             maxZoom: 18,
-                            minOpacity: 0.2,
+                            minOpacity: 0.4, // Fixed - controls color intensity, not transparency
                             max: 1.0,
                             gradient: {
-                                0.0: 'blue',
-                                0.2: 'cyan',
-                                0.4: 'lime',
-                                0.6: 'yellow',
-                                0.8: 'orange',
-                                1.0: 'red'
+                                0.0: 'blue',    // Low confidence (0-20%)
+                                0.2: 'cyan',   // Low-medium confidence (20-40%)
+                                0.4: 'lime',   // Medium confidence (40-60%)
+                                0.6: 'yellow', // Medium-high confidence (60-80%)
+                                0.8: 'orange', // High confidence (80-90%)
+                                1.0: 'red'     // Very high confidence (90-100%)
                             }
                         }).addTo(map);
+                        
+                        // Apply CSS opacity to the canvas element for true transparency control
+                        // This doesn't affect color values, only visual opacity
+                        setTimeout(() => {
+                            const canvas = map.getContainer().querySelector('canvas.leaflet-heatmap-layer');
+                            if (canvas) {
+                                canvas.style.opacity = transparency;
+                            }
+                        }, 100);
+                        
+                        window.dashboardHeatLayer = heatLayer;
+                        window.dashboardHeatData = heatData; // Store data for transparency updates
+                        window.dashboardHeatTransparency = transparency; // Store current transparency
                     } else {
                         // Fallback: log error
                         console.error('L.heatLayer is not available. Please check leaflet.heat library is loaded.');
@@ -4586,13 +4649,39 @@ def dashboard():
                 });
             } else if (mode === 'gradient') {
                 // Gradient mode - plot individual points with gradient colors
-                let minSignalVal = Math.min(...filtered.map(p => p.signal));
-                let maxSignalVal = Math.max(...filtered.map(p => p.signal));
-                let totalNetworks = filtered.length;
+                // Group points by GPS location to show all networks at same location in labels
+                let gpsGroups = {};
+                filtered.forEach(point => {
+                    // Round coordinates to group nearby points (same as markers mode)
+                    const latKey = point.lat ? point.lat.toFixed(6) : '0';
+                    const lonKey = point.lon ? point.lon.toFixed(6) : '0';
+                    const altKey = point.altitude ? point.altitude.toFixed(1) : '0';
+                    const gpsKey = `${latKey},${lonKey},${altKey}`;
+                    
+                    if (!gpsGroups[gpsKey]) {
+                        gpsGroups[gpsKey] = {
+                            lat: point.lat,
+                            lon: point.lon,
+                            altitude: point.altitude,
+                            networks: []
+                        };
+                    }
+                    gpsGroups[gpsKey].networks.push(point);
+                });
                 
-                filtered.forEach((point, index) => {
-                    let color = getGradientColor(point.signal, minSignalVal, maxSignalVal);
-                    let marker = L.circleMarker([point.lat, point.lon], {
+                let totalNetworks = filtered.length;
+                let gpsPlotIndex = 0;
+                
+                // Plot one marker per GPS location, showing all networks at that location
+                Object.keys(gpsGroups).forEach(gpsKey => {
+                    const location = gpsGroups[gpsKey];
+                    const networksAtLocation = location.networks;
+                    
+                    // Use the strongest signal for marker color
+                    const strongestSignal = Math.max(...networksAtLocation.map(n => n.signal));
+                    let color = getSignalColor(strongestSignal);
+                    
+                    let marker = L.circleMarker([location.lat, location.lon], {
                         radius: 8,
                         fillColor: color,
                         color: '#000',
@@ -4600,12 +4689,42 @@ def dashboard():
                         opacity: 1,
                         fillOpacity: 0.8
                     }).addTo(map);
-                    let altText = point.altitude ? '<br>Altitude: ' + point.altitude.toFixed(1) + 'm' : '';
-                    let googleMapsUrl = 'https://www.google.com/maps?q=' + point.lat + ',' + point.lon;
-                    let popupContent = '<b>' + (point.essid || '') + '</b><br>Signal: ' + point.signal + ' dBm<br>BSSID: ' + (point.bssid || '') + '<br>Channel: ' + (point.channel || '') + '<br>Latitude: ' + point.lat.toFixed(6) + '<br>Longitude: ' + point.lon.toFixed(6) + altText + '<br>Time: ' + (point.timestamp || '') + '<br><br><a href="' + googleMapsUrl + '" target="_blank" style="display: inline-block; padding: 6px 12px; background: #0066ff; color: white; text-decoration: none; border-radius: 4px; font-size: 0.9em; margin-top: 8px;">View in Google Maps</a>';
-                    marker.bindPopup(popupContent);
+                    
+                    // Build popup with all networks at this location
+                    let altText = location.altitude ? '<br>Altitude: ' + location.altitude.toFixed(1) + 'm' : '';
+                    let googleMapsUrl = 'https://www.google.com/maps?q=' + location.lat + ',' + location.lon;
+                    let popupContent = '<div style="max-width: 400px;">';
+                    popupContent += '<b>GPS Location</b><br>';
+                    popupContent += 'Latitude: ' + location.lat.toFixed(6) + '<br>';
+                    popupContent += 'Longitude: ' + location.lon.toFixed(6) + altText + '<br>';
+                    popupContent += 'Networks: ' + networksAtLocation.length + '<br>';
+                    popupContent += '<hr style="margin: 8px 0;">';
+                    popupContent += '<b>Networks at this location:</b><br>';
+                    popupContent += '<div style="max-height: 300px; overflow-y: auto; overflow-x: hidden; margin-top: 8px; padding: 4px; background: #f5f5f5; border-radius: 4px;">';
+                    
+                    networksAtLocation.forEach((net, idx) => {
+                        popupContent += '<div style="padding: 4px; margin-bottom: 4px; background: white; border-radius: 2px; border-left: 3px solid ' + getSignalColor(net.signal) + ';">';
+                        popupContent += '<b>' + (net.essid || 'Hidden') + '</b><br>';
+                        popupContent += 'BSSID: ' + (net.bssid || 'N/A') + '<br>';
+                        popupContent += 'Signal: ' + net.signal + ' dBm | Channel: ' + (net.channel || 'N/A');
+                        if (net.timestamp) {
+                            popupContent += '<br>Time: ' + net.timestamp;
+                        }
+                        popupContent += '</div>';
+                    });
+                    
+                    popupContent += '</div>';
+                    popupContent += '<br><a href="' + googleMapsUrl + '" target="_blank" style="display: inline-block; padding: 6px 12px; background: #0066ff; color: white; text-decoration: none; border-radius: 4px; font-size: 0.9em; margin-top: 8px;">View in Google Maps</a>';
+                    popupContent += '</div>';
+                    
+                    marker.bindPopup(popupContent, {maxWidth: 450});
+                    
+                    // Label shows all network ESSIDs at this location (one per line, bold with black outline)
                     if (labelsEnabled && totalNetworks <= 500) {
-                        marker.bindTooltip(point.essid, {
+                        // Use String.fromCharCode to avoid newline escaping issues in embedded JavaScript
+                        const newlineChar = String.fromCharCode(10);
+                        const labelText = networksAtLocation.map(n => (n.essid || 'Hidden')).join(newlineChar);
+                        marker.bindTooltip(labelText, {
                             permanent: true,
                             direction: 'center',
                             className: 'marker-label'
@@ -4613,30 +4732,27 @@ def dashboard():
                     }
                     
                     // Add hover events for bidirectional highlighting
-                    let pointId = `point_${index}_${Date.now()}`;
-                    marker.on('mouseover', function() {
-                        highlightRow(pointId);
-                        marker.setStyle({weight: 3, radius: 10});
-                    });
-                    marker.on('mouseout', function() {
-                        unhighlightRow(pointId);
-                        marker.setStyle({weight: 1, radius: 8});
+                    networksAtLocation.forEach((net, netIdx) => {
+                        let pointId = `gps_${gpsPlotIndex}_net_${netIdx}_${Date.now()}`;
+                        marker.on('mouseover', function() {
+                            marker.setStyle({weight: 3, radius: 10});
+                        });
+                        marker.on('mouseout', function() {
+                            marker.setStyle({weight: 1, radius: 8});
+                        });
+                        
+                        // Create table row for each network
+                        createTableRow(net, pointId, marker);
                     });
                     
                     markers.push(marker);
-                    bounds.push([point.lat, point.lon]);
-                    
-                    // Create table row
-                    createTableRow(point, pointId, marker);
+                    bounds.push([location.lat, location.lon]);
+                    gpsPlotIndex++;
                 });
                 
                 // Count unique GPS locations for gradient mode
-                let gpsLocations = new Set();
-                filtered.forEach(p => {
-                    const key = `${p.lat?.toFixed(6)},${p.lon?.toFixed(6)},${p.altitude?.toFixed(1) || '0'}`;
-                    gpsLocations.add(key);
-                });
-                updateStatusBadge(`${gpsLocations.size} GPS Plots | ${totalNetworks} Networks`, 'success');
+                const gpsPlotCount = Object.keys(gpsGroups).length;
+                updateStatusBadge(`${gpsPlotCount} GPS Plots | ${totalNetworks} Networks`, 'success');
             }
             if (bounds.length > 0) {
                 // Ensure map is available
@@ -4847,8 +4963,16 @@ def dashboard():
         }
         function updateLegend() {
             let legendContent = document.getElementById('legendContent');
+            let heatmapControls = document.getElementById('heatmapControls');
             legendContent.innerHTML = '';
             let mode = document.getElementById('displayMode') ? document.getElementById('displayMode').value : 'markers';
+            
+            // Show/hide heatmap intensity slider
+            if (mode === 'heatmap' && heatmapControls) {
+                heatmapControls.style.display = 'block';
+            } else if (heatmapControls) {
+                heatmapControls.style.display = 'none';
+            }
             
             // For markers mode, show network count legend; for other modes, show signal strength
             if (mode === 'markers') {
@@ -5117,45 +5241,67 @@ def dashboard():
             let res = await fetch(url);
             let essids = await res.json();
             let essidSelect = document.getElementById('essidSelect');
-            essidSelect.innerHTML = '<option value="">All</option>';
+            // Preserve selected values
+            let selectedValues = Array.from(essidSelect.selectedOptions).map(opt => opt.value).filter(v => v);
+            essidSelect.innerHTML = '';
             essids.forEach(e => {
                 let opt = document.createElement('option');
                 opt.value = e;
                 opt.textContent = e;
+                if (selectedValues.includes(e)) {
+                    opt.selected = true;
+                }
                 essidSelect.appendChild(opt);
             });
             await loadBssids();
             // Enable/disable ESSID filter based on display mode
             let displayMode = document.getElementById('displayMode').value;
-            essidSelect.disabled = (displayMode === 'heatmap');
+            // Heatmap mode now supports ESSID/BSSID filtering like other modes
         }
         window.loadEssids = loadEssids;
         async function loadBssids() {
             let session_id = document.getElementById('sessionSelect').value;
-            let essid = document.getElementById('essidSelect').value;
+            let essidSelect = document.getElementById('essidSelect');
+            // Get all selected ESSIDs (for multi-select)
+            let selectedEssids = Array.from(essidSelect.selectedOptions).map(opt => opt.value).filter(v => v);
             let url = `/api/bssids`;
             let params = [];
             if (session_id) params.push(`session_id=${session_id}`);
-            if (essid) params.push(`essid=${encodeURIComponent(essid)}`);
+            // Use first selected ESSID for BSSID filtering (or all if none selected)
+            if (selectedEssids.length > 0) {
+                params.push(`essid=${encodeURIComponent(selectedEssids[0])}`);
+            }
             if (params.length > 0) url += '?' + params.join('&');
             let res = await fetch(url);
             let bssids = await res.json();
             let bssidSelect = document.getElementById('bssidSelect');
-            bssidSelect.innerHTML = '<option value="">All</option>';
+            // Preserve selected values
+            let selectedValues = Array.from(bssidSelect.selectedOptions).map(opt => opt.value).filter(v => v);
+            bssidSelect.innerHTML = '';
             bssids.forEach(b => {
                 let opt = document.createElement('option');
                 opt.value = b;
                 opt.textContent = b;
+                if (selectedValues.includes(b)) {
+                    opt.selected = true;
+                }
                 bssidSelect.appendChild(opt);
             });
+            // Update Select All button text based on current selection
+            const button = bssidSelect.nextElementSibling;
+            if (button && button.tagName === 'BUTTON') {
+                const allSelected = bssids.length > 0 && bssids.every(b => selectedValues.includes(b));
+                button.textContent = allSelected ? 'Deselect All' : 'Select All';
+            }
         }
         window.loadBssids = loadBssids;
         async function refreshData() {
             let session_id = document.getElementById('sessionSelect')?.value || '';
-            let essid = document.getElementById('essidSelect')?.value || '';
-            let bssid = document.getElementById('bssidSelect')?.value || '';
-            let essidSearch = document.getElementById('essidSearch')?.value?.trim() || '';
-            let bssidSearch = document.getElementById('bssidSearch')?.value?.trim() || '';
+            let essidSelect = document.getElementById('essidSelect');
+            let bssidSelect = document.getElementById('bssidSelect');
+            // Get all selected ESSIDs and BSSIDs (for multi-select)
+            let selectedEssids = Array.from(essidSelect?.selectedOptions || []).map(opt => opt.value).filter(v => v);
+            let selectedBssids = Array.from(bssidSelect?.selectedOptions || []).map(opt => opt.value).filter(v => v);
             let dateFrom = document.getElementById('dateFrom')?.value || '';
             let dateTo = document.getElementById('dateTo')?.value || '';
             let minAlt = document.getElementById('minAlt')?.value || '';
@@ -5163,34 +5309,23 @@ def dashboard():
             let url = `/api/data`;
             let params = [];
             if (session_id) params.push(`session_id=${session_id}`);
-            // Use search if provided, otherwise use exact match
-            if (essidSearch) {
-                params.push(`essid_search=${encodeURIComponent(essidSearch)}`);
-            } else if (essid) {
-                const essidSelect = document.getElementById('essidSelect');
-                if (essidSelect && !essidSelect.disabled) {
-                    params.push(`essid=${encodeURIComponent(essid)}`);
-                }
+            // Use multi-select values (comma-separated)
+            if (selectedEssids.length > 0 && essidSelect && !essidSelect.disabled) {
+                params.push(`essid=${encodeURIComponent(selectedEssids.join(','))}`);
             }
-            if (bssidSearch) {
-                params.push(`bssid_search=${encodeURIComponent(bssidSearch)}`);
-            } else if (bssid) {
-                params.push(`bssid=${encodeURIComponent(bssid)}`);
+            if (selectedBssids.length > 0) {
+                params.push(`bssid=${encodeURIComponent(selectedBssids.join(','))}`);
             }
             if (dateFrom) params.push(`date_from=${dateFrom}`);
             if (dateTo) params.push(`date_to=${dateTo}`);
             if (minAlt) params.push(`min_alt=${minAlt}`);
             if (maxAlt) params.push(`max_alt=${maxAlt}`);
             if (params.length > 0) url += '?' + params.join('&');
-            // Reset border colors for ESSID/BSSID inputs
+            // Reset border colors for ESSID/BSSID selects
             const essidSelectEl = document.getElementById('essidSelect');
             const bssidSelectEl = document.getElementById('bssidSelect');
-            const essidSearchEl = document.getElementById('essidSearch');
-            const bssidSearchEl = document.getElementById('bssidSearch');
             if (essidSelectEl) essidSelectEl.style.borderColor = '';
             if (bssidSelectEl) bssidSelectEl.style.borderColor = '';
-            if (essidSearchEl) essidSearchEl.style.borderColor = '';
-            if (bssidSearchEl) bssidSearchEl.style.borderColor = '';
             
             updateStatusBadge('Loading...', 'warning');
             try {
@@ -5216,10 +5351,11 @@ def dashboard():
         window.refreshData = refreshData;
         function clearFilters() {
             document.getElementById('sessionSelect').value = '';
-            document.getElementById('essidSelect').value = '';
-            document.getElementById('bssidSelect').value = '';
-            document.getElementById('essidSearch').value = '';
-            document.getElementById('bssidSearch').value = '';
+            // Clear multi-selects
+            let essidSelect = document.getElementById('essidSelect');
+            let bssidSelect = document.getElementById('bssidSelect');
+            Array.from(essidSelect.options).forEach(opt => opt.selected = false);
+            Array.from(bssidSelect.options).forEach(opt => opt.selected = false);
             document.getElementById('minSignal').value = '-100';
             document.getElementById('maxSignal').value = '0';
             document.getElementById('channelFilter').value = '';
@@ -5230,16 +5366,41 @@ def dashboard():
             refreshData();
         }
         window.clearFilters = clearFilters;
+        function toggleSelectAll(selectId) {
+            const select = document.getElementById(selectId);
+            if (!select) return;
+            
+            // Get all options except the first one (usually "All" option)
+            const options = Array.from(select.options).filter(opt => opt.value !== '');
+            const allSelected = options.every(opt => opt.selected);
+            
+            // Toggle all options
+            options.forEach(opt => {
+                opt.selected = !allSelected;
+            });
+            
+            // Update button text
+            const button = select.nextElementSibling;
+            if (button && button.tagName === 'BUTTON') {
+                button.textContent = allSelected ? 'Select All' : 'Deselect All';
+            }
+            
+            // Trigger change event to refresh data
+            select.dispatchEvent(new Event('change'));
+        }
+        window.toggleSelectAll = toggleSelectAll;
         function showDeleteDialog() {
             let session_id = document.getElementById('sessionSelect').value;
-            let essid = document.getElementById('essidSelect').value;
-            let bssid = document.getElementById('bssidSelect').value;
+            let essidSelect = document.getElementById('essidSelect');
+            let bssidSelect = document.getElementById('bssidSelect');
+            let selectedEssids = Array.from(essidSelect.selectedOptions).map(opt => opt.value).filter(v => v);
+            let selectedBssids = Array.from(bssidSelect.selectedOptions).map(opt => opt.value).filter(v => v);
             let dateFrom = document.getElementById('dateFrom').value;
             let dateTo = document.getElementById('dateTo').value;
             let filters = [];
             if (session_id) filters.push(`Session: ${session_id}`);
-            if (essid) filters.push(`ESSID: ${essid}`);
-            if (bssid) filters.push(`BSSID: ${bssid}`);
+            if (selectedEssids.length > 0) filters.push(`ESSID: ${selectedEssids.join(', ')}`);
+            if (selectedBssids.length > 0) filters.push(`BSSID: ${selectedBssids.join(', ')}`);
             if (dateFrom) filters.push(`From: ${dateFrom}`);
             if (dateTo) filters.push(`To: ${dateTo}`);
             let filterText = filters.length > 0 ? filters.join(', ') : 'all tracks';
@@ -5254,14 +5415,16 @@ def dashboard():
         window.closeDeleteDialog = closeDeleteDialog;
         async function confirmDelete() {
             let session_id = document.getElementById('sessionSelect').value;
-            let essid = document.getElementById('essidSelect').value;
-            let bssid = document.getElementById('bssidSelect').value;
+            let essidSelect = document.getElementById('essidSelect');
+            let bssidSelect = document.getElementById('bssidSelect');
+            let selectedEssids = Array.from(essidSelect.selectedOptions).map(opt => opt.value).filter(v => v);
+            let selectedBssids = Array.from(bssidSelect.selectedOptions).map(opt => opt.value).filter(v => v);
             let dateFrom = document.getElementById('dateFrom').value;
             let dateTo = document.getElementById('dateTo').value;
             let deleteData = {};
             if (session_id) deleteData.session_id = session_id;
-            if (essid) deleteData.essid = essid;
-            if (bssid) deleteData.bssid = bssid;
+            if (selectedEssids.length > 0) deleteData.essid = selectedEssids.join(',');
+            if (selectedBssids.length > 0) deleteData.bssid = selectedBssids.join(',');
             if (dateFrom) deleteData.date_from = dateFrom;
             if (dateTo) deleteData.date_to = dateTo;
             try {
@@ -5307,7 +5470,7 @@ def dashboard():
                     let displayMode = this.value;
                     let essidSelect = document.getElementById('essidSelect');
                     if (essidSelect) {
-                        essidSelect.disabled = (displayMode === 'heatmap');
+                        // Heatmap mode now supports ESSID/BSSID filtering like other modes
                     }
                     // Update legend when mode changes
                     if (typeof window.updateLegend === 'function') {
@@ -5318,6 +5481,34 @@ def dashboard():
                     }
                 });
                 displayModeSelect.setAttribute('data-listener-attached', 'true');
+            }
+            
+            // Heatmap transparency slider
+            const heatmapTransparency = document.getElementById('heatmapTransparency');
+            if (heatmapTransparency && !heatmapTransparency.hasAttribute('data-listener-attached')) {
+                heatmapTransparency.addEventListener('input', function() {
+                    let value = parseFloat(this.value);
+                    let percent = Math.round(value * 100);
+                    let transparencyValue = document.getElementById('transparencyValue');
+                    if (transparencyValue) {
+                        transparencyValue.textContent = percent + '%';
+                    }
+                    // Update existing heatmap layer opacity without recalculating data
+                    let displayMode = document.getElementById('displayMode')?.value;
+                    if (displayMode === 'heatmap' && window.dashboardHeatLayer) {
+                        const map = window.dashboardMap;
+                        if (map && window.dashboardHeatLayer) {
+                            // Apply CSS opacity directly to the canvas - this only affects visual transparency
+                            // and does NOT change the color/intensity values
+                            const canvas = map.getContainer().querySelector('canvas.leaflet-heatmap-layer');
+                            if (canvas) {
+                                canvas.style.opacity = value;
+                                window.dashboardHeatTransparency = value;
+                            }
+                        }
+                    }
+                });
+                heatmapTransparency.setAttribute('data-listener-attached', 'true');
             }
             
             // Map style dropdown
@@ -5539,52 +5730,21 @@ def dashboard():
             
             // Function to constrain position within entire map window (including data table area)
             function constrainPosition(x, y) {
-                const legendRect = legend.getBoundingClientRect();
-                const legendWidth = legendRect.width;
-                const legendHeight = legendRect.height;
+                const container = document.getElementById('map-container');
+                if (!container) return {x: x, y: y};
                 
-                // Get the map tab or dashboard container - use the entire visible area
-                const mapTab = document.getElementById('mapTab');
-                const dashboardContainer = document.getElementById('dashboardContainer');
-                const mapContainer = document.getElementById('map-container');
+                const legendWidth = legend.offsetWidth || 200;
+                const legendHeight = legend.offsetHeight || 100;
+                const containerWidth = container.offsetWidth;
+                const containerHeight = container.offsetHeight;
                 
-                let containerRect;
-                if (mapTab && mapTab.classList.contains('active')) {
-                    // Use map tab bounds when map tab is active
-                    containerRect = mapTab.getBoundingClientRect();
-                } else if (dashboardContainer) {
-                    // Use dashboard container bounds
-                    containerRect = dashboardContainer.getBoundingClientRect();
-                } else if (mapContainer) {
-                    // Fallback to map container
-                    containerRect = mapContainer.getBoundingClientRect();
-                } else {
-                    // Final fallback to viewport
-                    const viewportWidth = window.innerWidth;
-                    const viewportHeight = window.innerHeight;
-                    const minX = 0;
-                    const maxX = viewportWidth - legendWidth;
-                    const minY = 0;
-                    const maxY = viewportHeight - legendHeight;
-                    return {
-                        x: Math.max(minX, Math.min(maxX, x)),
-                        y: Math.max(minY, Math.min(maxY, y))
-                    };
-                }
-                
-                const containerLeft = containerRect.left;
-                const containerTop = containerRect.top;
-                const containerWidth = containerRect.width;
-                const containerHeight = containerRect.height;
-                
-                // Constrain X position (keep legend within container horizontal bounds)
-                const minX = containerLeft;
-                const maxX = containerLeft + containerWidth - legendWidth;
+                // Constrain to map container bounds (relative positioning)
+                const minX = 0;
+                const maxX = containerWidth - legendWidth;
                 const constrainedX = Math.max(minX, Math.min(maxX, x));
                 
-                // Constrain Y position (keep legend within container vertical bounds)
-                const minY = containerTop;
-                const maxY = containerTop + containerHeight - legendHeight;
+                const minY = 0;
+                const maxY = containerHeight - legendHeight;
                 const constrainedY = Math.max(minY, Math.min(maxY, y));
                 
                 return {x: constrainedX, y: constrainedY};
@@ -5615,16 +5775,35 @@ def dashboard():
             function dragStart(e) {
                 if (e.button !== 0) return; // Only handle left mouse button
                 isDragging = true;
-                initialX = e.clientX - xOffset;
-                initialY = e.clientY - yOffset;
+                const container = document.getElementById('map-container');
+                if (!container) return;
+                const containerRect = container.getBoundingClientRect();
+                // Get current legend position relative to container
+                const legendRect = legend.getBoundingClientRect();
+                const currentX = legendRect.left - containerRect.left;
+                const currentY = legendRect.top - containerRect.top;
+                initialX = e.clientX - currentX;
+                initialY = e.clientY - currentY;
                 legend.classList.add('dragging');
             }
             
             function drag(e) {
                 if (!isDragging) return;
                 e.preventDefault();
-                currentX = e.clientX - initialX;
-                currentY = e.clientY - initialY;
+                const container = document.getElementById('map-container');
+                if (!container) return;
+                const containerRect = container.getBoundingClientRect();
+                // Calculate position relative to container
+                currentX = e.clientX - containerRect.left - (e.clientX - initialX);
+                currentY = e.clientY - containerRect.top - (e.clientY - initialY);
+                // Get current position from legend style or calculate from mouse
+                const rect = legend.getBoundingClientRect();
+                const relX = rect.left - containerRect.left;
+                const relY = rect.top - containerRect.top;
+                const deltaX = e.clientX - (initialX + relX);
+                const deltaY = e.clientY - (initialY + relY);
+                currentX = relX + deltaX;
+                currentY = relY + deltaY;
                 const constrained = constrainPosition(currentX, currentY);
                 xOffset = constrained.x;
                 yOffset = constrained.y;
@@ -5642,7 +5821,14 @@ def dashboard():
                 localStorage.setItem('legendPosition', JSON.stringify({x: xOffset, y: yOffset}));
             }
             
-            legend.addEventListener('mousedown', dragStart);
+            // Only allow dragging from the legend header (drag handle area)
+            const legendHeader = legend.querySelector('.legend-header');
+            if (legendHeader) {
+                legendHeader.addEventListener('mousedown', dragStart);
+                legendHeader.style.cursor = 'move';
+            }
+            // Prevent dragging from the rest of the legend
+            legend.style.cursor = 'default';
             document.addEventListener('mousemove', drag);
             document.addEventListener('mouseup', dragEnd);
         }
@@ -5842,6 +6028,7 @@ def dashboard():
         if (typeof loadEssids === 'function') window.loadEssids = loadEssids;
         if (typeof loadBssids === 'function') window.loadBssids = loadBssids;
         if (typeof plotData === 'function') window.plotData = plotData;
+        if (typeof toggleSelectAll === 'function') window.toggleSelectAll = toggleSelectAll;
         if (typeof switchTab === 'function') window.switchTab = switchTab;
         
         // If DOMContentLoaded already fired, initialize immediately
@@ -6218,8 +6405,8 @@ def index():
 
         <div class="tabs">
             <button class="tab active" onclick="switchTab('control', event)">Control</button>
-            <button class="tab" onclick="switchTab('config', event)">Config</button>
             <button class="tab" onclick="switchTab('map', event)">Map</button>
+            <button class="tab" onclick="switchTab('config', event)">Config</button>
         </div>
 
         <!-- Control Tab -->
@@ -6796,6 +6983,7 @@ def index():
                                             'if (typeof makeLegendDraggable !== "undefined" && typeof makeLegendDraggable === "function") window.makeLegendDraggable = makeLegendDraggable; ' +
                                             'if (typeof initDashboard !== "undefined" && typeof initDashboard === "function") window.initDashboard = initDashboard; ' +
                                             'if (typeof attachDashboardEventListeners !== "undefined" && typeof attachDashboardEventListeners === "function") window.attachDashboardEventListeners = attachDashboardEventListeners; ' +
+                                            'if (typeof toggleSelectAll !== "undefined" && typeof toggleSelectAll === "function") window.toggleSelectAll = toggleSelectAll; ' +
                                             'if (typeof switchTab !== "undefined" && typeof switchTab === "function") window.switchTab = switchTab; ' +
                                             '} catch(e) { console.error("[ERROR] Error exposing functions:", e); } })();';
                                         scriptContent = scriptContent + exposeCode;
@@ -6803,7 +6991,7 @@ def index():
                                         // For the last script, add additional exposure code after script execution
                                         if (index === allScripts.length - 1) {
                                             // Add exposure code after script execution with retries (single line to avoid newline issues)
-                                            const exposeCode = ';(function() { const exposeFuncs = function() { try { if (typeof refreshData === "function") window.refreshData = refreshData; if (typeof exportData === "function") window.exportData = exportData; if (typeof toggleLabels === "function") window.toggleLabels = toggleLabels; if (typeof toggleLegend === "function") window.toggleLegend = toggleLegend; if (typeof toggleDataTable === "function") window.toggleDataTable = toggleDataTable; if (typeof loadSessions === "function") window.loadSessions = loadSessions; if (typeof loadEssids === "function") window.loadEssids = loadEssids; if (typeof loadBssids === "function") window.loadBssids = loadBssids; if (typeof plotData === "function") window.plotData = plotData; if (typeof clearFilters === "function") window.clearFilters = clearFilters; if (typeof showDeleteDialog === "function") window.showDeleteDialog = showDeleteDialog; if (typeof closeDeleteDialog === "function") window.closeDeleteDialog = closeDeleteDialog; if (typeof confirmDelete === "function") window.confirmDelete = confirmDelete; if (typeof toggleColorEditor === "function") window.toggleColorEditor = toggleColorEditor; if (typeof updateLegend === "function") window.updateLegend = updateLegend; if (typeof makeLegendDraggable === "function") window.makeLegendDraggable = makeLegendDraggable; if (typeof initDashboard === "function") window.initDashboard = initDashboard; if (typeof attachDashboardEventListeners === "function") window.attachDashboardEventListeners = attachDashboardEventListeners; if (typeof switchTab === "function") window.switchTab = switchTab; } catch(e) { console.error("[ERROR] Error exposing functions:", e); } }; exposeFuncs(); setTimeout(exposeFuncs, 50); setTimeout(exposeFuncs, 200); setTimeout(exposeFuncs, 500); })();';
+                                            const exposeCode = ';(function() { const exposeFuncs = function() { try { if (typeof refreshData === "function") window.refreshData = refreshData; if (typeof exportData === "function") window.exportData = exportData; if (typeof toggleLabels === "function") window.toggleLabels = toggleLabels; if (typeof toggleLegend === "function") window.toggleLegend = toggleLegend; if (typeof toggleDataTable === "function") window.toggleDataTable = toggleDataTable; if (typeof loadSessions === "function") window.loadSessions = loadSessions; if (typeof loadEssids === "function") window.loadEssids = loadEssids; if (typeof loadBssids === "function") window.loadBssids = loadBssids; if (typeof plotData === "function") window.plotData = plotData; if (typeof clearFilters === "function") window.clearFilters = clearFilters; if (typeof showDeleteDialog === "function") window.showDeleteDialog = showDeleteDialog; if (typeof closeDeleteDialog === "function") window.closeDeleteDialog = closeDeleteDialog; if (typeof confirmDelete === "function") window.confirmDelete = confirmDelete; if (typeof toggleColorEditor === "function") window.toggleColorEditor = toggleColorEditor; if (typeof updateLegend === "function") window.updateLegend = updateLegend; if (typeof makeLegendDraggable === "function") window.makeLegendDraggable = makeLegendDraggable; if (typeof initDashboard === "function") window.initDashboard = initDashboard; if (typeof attachDashboardEventListeners === "function") window.attachDashboardEventListeners = attachDashboardEventListeners; if (typeof toggleSelectAll === "function") window.toggleSelectAll = toggleSelectAll; if (typeof switchTab === "function") window.switchTab = switchTab; } catch(e) { console.error("[ERROR] Error exposing functions:", e); } }; exposeFuncs(); setTimeout(exposeFuncs, 50); setTimeout(exposeFuncs, 200); setTimeout(exposeFuncs, 500); })();';
                                             scriptContent = scriptContent + exposeCode;
                                         }
                                         newScript.textContent = scriptContent;
@@ -6817,7 +7005,7 @@ def index():
                                         if (index === allScripts.length - 1) {
                                             setTimeout(function() {
                                                 // Force exposure of all functions after all scripts are loaded
-                                                const funcs = ['refreshData', 'exportData', 'toggleLabels', 'toggleLegend', 'toggleDataTable', 'loadSessions', 'loadEssids', 'loadBssids', 'plotData', 'clearFilters', 'showDeleteDialog', 'closeDeleteDialog', 'confirmDelete', 'toggleColorEditor', 'updateLegend', 'makeLegendDraggable', 'initDashboard', 'attachDashboardEventListeners'];
+                                                const funcs = ['refreshData', 'exportData', 'toggleLabels', 'toggleLegend', 'toggleDataTable', 'loadSessions', 'loadEssids', 'loadBssids', 'plotData', 'clearFilters', 'showDeleteDialog', 'closeDeleteDialog', 'confirmDelete', 'toggleColorEditor', 'updateLegend', 'makeLegendDraggable', 'initDashboard', 'attachDashboardEventListeners', 'toggleSelectAll'];
                                                 funcs.forEach(function(name) {
                                                     try {
                                                         // Try to get function from global scope
@@ -6890,7 +7078,7 @@ def index():
                                                   'loadSessions', 'loadEssids', 'loadBssids', 'plotData',
                                                   'clearFilters', 'showDeleteDialog', 'closeDeleteDialog', 'confirmDelete',
                                                   'toggleColorEditor', 'updateLegend', 'makeLegendDraggable', 'initDashboard',
-                                                  'attachDashboardEventListeners'];
+                                                  'attachDashboardEventListeners', 'toggleSelectAll'];
                                     
                                     // Try multiple times with increasing delays
                                     let attempts = 0;

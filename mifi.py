@@ -525,7 +525,7 @@ class wifi_cracker:
             # Clear monitor_candidates
             config['DEFAULT']['monitor_candidates'] = ''
             
-            with open("config/config.ini", "w") as f:
+            with open(config_path, "w") as f:
                 config.write(f)
             self.log("Cleared monitor_candidates from config/config.ini", indent=8, prefix="check")
         except Exception as e:
