@@ -1123,23 +1123,13 @@ def api_start():
             cmd.extend(['-MS', str(data['max_scans'])])
         if data.get('scan_duration'):
             cmd.extend(['-MSD', str(data['scan_duration'])])
-        # Auto-detect GPS device if GPS is enabled in dashboard, otherwise use provided or auto-detect
-        gps_port = data.get('gps_port')
-        if not gps_port:
-            # Check if GPS is enabled and get the device
-            if mifi_service and mifi_service.gps_thread and mifi_service.gps_thread.is_alive():
-                # GPS is running - try to detect the device
-                usb_devices = []
-                try:
-                    usb_devices = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
-                    usb_devices = [d for d in usb_devices if d and os.path.exists(d)]
-                    if usb_devices:
-                        gps_port = usb_devices[0]
-                except Exception:
-                    pass
-            # If still not found, let map mode auto-detect (don't pass -GPS arg)
-        if gps_port:
-            cmd.extend(['-GPS', gps_port])
+        # overwatch branch: there is no local USB GPS device in this container —
+        # GPS comes from network gpsd (mifi_service.gps_network_host/port).
+        # -GPS only needs to satisfy mifi.py's os.path.exists() gate, so we
+        # always point it at the stub file rather than trying to auto-detect
+        # a /dev/ttyUSB*/ttyACM* device that will never be present here.
+        gps_port = data.get('gps_port') or os.path.join(os.path.dirname(__file__), '.gps-stub')
+        cmd.extend(['-GPS', gps_port])
         if data.get('gps_lock_attempts'):
             cmd.extend(['-GLA', str(data['gps_lock_attempts'])])
         if data.get('gps_lock_wait'):
@@ -2438,7 +2428,7 @@ def api_gps_toggle():
         try:
             from mifi import wifi_cracker
             mifi_service = wifi_cracker()
-            mifi_service.load_config()
+            mifi_service.initial_config()
             mifi_service.verbose = verbose_requested
             mifi_service.debug = DEBUG_MODE
             
@@ -2482,41 +2472,25 @@ def api_gps_toggle():
             return jsonify({'success': True, 'enabled': False, 'details': status_details})
         else:
             # Enable GPS monitoring
-            # Check for USB GPS devices first
-            usb_devices = []
-            try:
-                usb_devices = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
-                usb_devices = [d for d in usb_devices if d and os.path.exists(d)]
-            except Exception as e:
-                debug_print(f"Error checking USB devices: {e}")
-            
-            if not usb_devices:
-                mifi_status['gps_enabled'] = False
-                mifi_status['gps_status'] = 'no_device'
-                save_state()
-                status_details = {
-                    'enabled': False,
-                    'status': 'no_device',
-                    'message': 'No GPS USB device found. Please connect a GPS device.'
-                }
-                return jsonify({'success': False, 'enabled': False, 'details': status_details})
-            
-            # Use the first available USB device
-            gps_device = usb_devices[0]
-            
+            # overwatch branch: GPS is a network gpsd client (10.0.0.2:2947 by
+            # default, configurable in config/config.ini [GPS]) — there is no
+            # local USB GPS device to check for, so we go straight to
+            # start_gps_polling() and let it report connectivity/fix status.
+
             # Set verbose mode if requested
             if verbose_requested:
                 mifi_service.verbose = True
             
-            # Start GPS polling using mifi.py's native service
-            if mifi_service.start_gps_polling(gps_device=gps_device):
+            # Start GPS polling using mifi.py's native service (network gpsd)
+            if mifi_service.start_gps_polling():
                 mifi_status['gps_enabled'] = True
                 mifi_status['gps_status'] = 'searching'
                 save_state()
+                gps_target = f"{mifi_service.gps_network_host}:{mifi_service.gps_network_port}"
                 status_details = {
                     'enabled': True,
                     'status': 'searching',
-                    'message': f'GPS monitoring enabled - Using device {gps_device}...'
+                    'message': f'GPS monitoring enabled - connecting to gpsd at {gps_target}...'
                 }
                 return jsonify({'success': True, 'enabled': True, 'details': status_details})
             else:
@@ -2525,10 +2499,11 @@ def api_gps_toggle():
                 mifi_status['gps_status'] = current_status
                 mifi_status['gps_enabled'] = False
                 save_state()
+                gps_target = f"{mifi_service.gps_network_host}:{mifi_service.gps_network_port}"
                 status_details = {
                     'enabled': False,
                     'status': current_status,
-                    'message': f'GPS device {gps_device} found but gpsd is not running or not accessible.'
+                    'message': f'Could not reach gpsd at {gps_target}. Confirm gpsd-overwatch.service is running there.'
                 }
                 return jsonify({'success': False, 'enabled': False, 'details': status_details})
     except Exception as e:
@@ -2536,22 +2511,6 @@ def api_gps_toggle():
         import traceback
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e), 'enabled': False}), 500
-        import traceback
-        traceback.print_exc()
-        # Check if it's a no device error
-        error_str = str(e).lower()
-        if 'no device' in error_str or 'no usb' in error_str or 'device not found' in error_str:
-            mifi_status['gps_status'] = 'no_device'
-            mifi_status['gps_enabled'] = False
-            save_state()
-            status_details = {
-                'enabled': False,
-                'status': 'no_device',
-                'message': 'No GPS USB device found. Please connect a GPS device.'
-            }
-            return jsonify({'success': False, 'enabled': False, 'details': status_details})
-        else:
-            return jsonify({'success': False, 'error': str(e), 'enabled': False}), 500
 
 # ===== DASHBOARD API ROUTES =====
 
