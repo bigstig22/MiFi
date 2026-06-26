@@ -58,8 +58,6 @@ class wifi_cracker:
 
         # GPS tracking variables
         self.gps_port = None
-        self.gps_baudrate = 9600
-        self.gps_serial = None
         self.tracking_active = False
         self.tracked_essid = None
         self.tracked_bssid = None
@@ -1459,33 +1457,10 @@ class wifi_cracker:
 
         self.log(f"Processing complete.",prefix="exited")
 
-    def init_gps(self, port="/dev/ttyUSB0", baudrate=9600):
-        """
-        Initialize GPS connection via USB serial port.
-        Note: This is optional if using gpsd - gps3 handles the connection via gpsd.
-        """
-        if serial is None:
-            self.log("pyserial not available. GPS serial initialization skipped (using gpsd instead).", indent=4, prefix="dash")
-            return False
-            
-        self.gps_port = port
-        self.gps_baudrate = baudrate
-        
-        try:
-            self.gps_serial = serial.Serial(port, baudrate, timeout=1)
-            self.log(f"GPS serial initialized on {port} at {baudrate} baud", indent=4, prefix="check")
-            return True
-        except AttributeError as e:
-            self.log(f"Serial module error: {e}", prefix="error")
-            self.log("This may be due to conflicting 'serial' package. Install 'pyserial' instead.", indent=4, prefix="error")
-            self.log("Note: GPS functionality via gpsd (gps3) should still work.", indent=4, prefix="dash")
-            return False
-        except Exception as e:
-            self.log(f"Failed to initialize GPS serial on {port}: {e}", prefix="error")
-            self.log("Note: GPS functionality via gpsd (gps3) should still work.", indent=4, prefix="dash")
-            return False
+    # NOTE (overwatch branch): direct-serial GPS init removed. GPS is provided
+    # exclusively via gpsd over the network (10.0.0.2:2947) — see start_gps_polling().
 
-    def check_gpsd_running(self, gps_host="127.0.0.1", gps_port=2947):
+    def check_gpsd_running(self, gps_host="10.0.0.2", gps_port=2947):
         """
         Check if gpsd is running and accessible.
         """
@@ -1499,7 +1474,7 @@ class wifi_cracker:
         except Exception:
             return False
 
-    def start_gps_polling(self, gps_host="127.0.0.1", gps_port=2947, poll_interval=0.5, gps_device=None):
+    def start_gps_polling(self, gps_host="10.0.0.2", gps_port=2947, poll_interval=0.5, gps_device=None):
         """
         Starts a background thread that polls gpsd for the latest GPS fix every poll_interval seconds using gps3.
         Continuously updates the latest GPS position as new data arrives.
@@ -3299,385 +3274,6 @@ def reexec_with_nohup():
         )
     sys.exit(0)
 
-class InteractiveCLIState:
-    """State container for interactive CLI session"""
-    def __init__(self):
-        self.gps_active = False
-        self.tak_active = False
-        self.tak_password = None
-
-def _run_interactive_cli(suite, version):
-    """Run interactive CLI server with persistent services"""
-    import shlex
-    
-    # Welcome banner with ASCII art
-    banner = f"""
-    ╔══════════════════════════════════════════════════════════════╗
-    ║                                                              ║
-    ║        ███╗   ███╗██╗███████╗██╗                           ║
-    ║        ████╗ ████║██║██╔════╝██║                           ║
-    ║        ██╔████╔██║██║█████╗  ██║                           ║
-    ║        ██║╚██╔╝██║██║██╔══╝  ██║                           ║
-    ║        ██║ ╚═╝ ██║██║██║     ██║                           ║
-    ║        ╚═╝     ╚═╝╚═╝╚═╝     ╚═╝                           ║
-    ║                                                              ║
-    ║     Handshake Collector and Processor Tool v{version}        ║
-    ║                                                              ║
-    ╚══════════════════════════════════════════════════════════════╝
-    """
-    print(banner)
-    print("    Initializing system...\n")
-    
-    # Initial configuration checks
-    suite.initial_config()
-    
-    print("\n    ✓ System Ready\n")
-    print("    Type 'help' or '-h' for available commands")
-    print("    Type 'q' or 'quit' to exit\n")
-    
-    # Background service states
-    cli_state = InteractiveCLIState()
-    
-    # Main command loop
-    while True:
-        try:
-            # Show status indicators
-            status_line = "    ["
-            if cli_state.gps_active:
-                status_line += "GPS:ON "
-            else:
-                status_line += "GPS:OFF "
-            if cli_state.tak_active:
-                status_line += "TAK:ON"
-            else:
-                status_line += "TAK:OFF"
-            status_line += "]"
-            print(status_line)
-            
-            # Get user input
-            command = input("mifi> ").strip()
-            
-            if not command:
-                continue
-            
-            # Handle quit
-            if command.lower() in ['q', 'quit', 'exit']:
-                print("\n    Shutting down...")
-                if cli_state.gps_active:
-                    suite.stop_gps_polling()
-                if cli_state.tak_active and suite.tak_socket:
-                    try:
-                        suite.tak_socket.close()
-                    except:
-                        pass
-                print("    Goodbye!\n")
-                break
-            
-            # Handle help
-            if command.lower() in ['-h', '--help', 'help']:
-                # Show interactive help (full argparse help is available via original CLI)
-                _print_interactive_help()
-                continue
-            
-            # Handle GPS toggle
-            if command.lower() == 'gps':
-                if cli_state.gps_active:
-                    suite.stop_gps_polling()
-                    cli_state.gps_active = False
-                    suite.log("GPS polling stopped", prefix="check")
-                else:
-                    gps_port = suite.gps_port if suite.gps_port else "/dev/ttyUSB0"
-                    if suite.start_gps_polling(gps_device=gps_port):
-                        cli_state.gps_active = True
-                        suite.log("GPS polling started", prefix="check")
-                    else:
-                        suite.log("Failed to start GPS polling. Ensure gpsd is running.", prefix="x")
-                continue
-            
-            # Handle TAK toggle
-            if command.lower() == 'tak':
-                if cli_state.tak_active:
-                    if suite.tak_socket:
-                        try:
-                            suite.tak_socket.close()
-                        except:
-                            pass
-                    suite.tak_connected = False
-                    cli_state.tak_active = False
-                    cli_state.tak_password = None
-                    suite.log("TAK connection closed", prefix="check")
-                else:
-                    if not suite.tak_enabled:
-                        suite.log("TAK not configured. Configure in config/config.ini [TAK] section first.", prefix="x")
-                        continue
-                    
-                    # Get password if needed
-                    if not cli_state.tak_password:
-                        import getpass
-                        try:
-                            cli_state.tak_password = getpass.getpass("    Enter PKCS#12 certificate password: ")
-                        except KeyboardInterrupt:
-                            print("\n    Cancelled.")
-                            continue
-                    
-                    suite.log("Connecting to TAK server...", prefix="config")
-                    success = suite.init_tak_connection(
-                        host=suite.tak_host,
-                        port=suite.tak_port,
-                        protocol=suite.tak_protocol,
-                        cert_file=suite.tak_cert_file,
-                        key_file=suite.tak_key_file,
-                        ca_file=suite.tak_ca_file,
-                        api_token=suite.tak_api_token,
-                        cert_password=cli_state.tak_password
-                    )
-                    
-                    if success:
-                        cli_state.tak_active = True
-                        suite.log("TAK connection established", prefix="check")
-                    else:
-                        cli_state.tak_password = None  # Clear invalid password
-                        suite.log("TAK connection failed", prefix="x")
-                continue
-            
-            # Parse and execute command
-            try:
-                # Parse command like "collect -auto -IS 5"
-                cmd_parts = shlex.split(command)
-                if not cmd_parts:
-                    continue
-                
-                mode_cmd = cmd_parts[0]
-                cmd_args = cmd_parts[1:] if len(cmd_parts) > 1 else []
-                
-                # Parse arguments into dict
-                parsed_args = {}
-                i = 0
-                while i < len(cmd_args):
-                    arg = cmd_args[i]
-                    if arg.startswith('-'):
-                        # Remove leading dashes
-                        key = arg.lstrip('-')
-                        # Skip boolean flags that don't take values (like -tak, -auto, -manual)
-                        if key.lower() in ['tak', 'auto', 'manual', 'a', 'm']:
-                            parsed_args[key.lower()] = True
-                            i += 1
-                        # Check if next arg is a value
-                        elif i + 1 < len(cmd_args) and not cmd_args[i + 1].startswith('-'):
-                            parsed_args[key] = cmd_args[i + 1]
-                            i += 2
-                        else:
-                            parsed_args[key] = True
-                            i += 1
-                    else:
-                        i += 1
-                
-                # Execute mode
-                _execute_interactive_mode(suite, mode_cmd, parsed_args, cli_state)
-                
-            except Exception as e:
-                suite.log(f"Error executing command: {e}", prefix="x")
-                import traceback
-                if suite.verbose:
-                    traceback.print_exc()
-            
-            print()  # Blank line after command
-            
-        except KeyboardInterrupt:
-            print("\n\n    Interrupted. Type 'q' to quit or continue with commands.")
-        except EOFError:
-            print("\n    Goodbye!\n")
-            break
-
-def _print_interactive_help():
-    """Print help for interactive mode"""
-    help_text = """
-    Available Commands:
-    
-    Mode Commands:
-      collect -manual [options]    Manual collection mode
-      collect -auto [options]       Automated collection mode
-      process -manual [options]    Manual processing mode
-      process -auto [options]       Automated processing mode
-      target [options]              Target specific network
-      map [options]                 GPS mapping mode
-      config                        Configure interface
-      clean                         Clean logs and database
-    
-    Service Commands:
-      gps                           Toggle GPS polling service
-      tak                           Toggle TAK connection service
-    
-    Options (examples):
-      -IS <seconds>                 Initial scan timeout
-      -TS <seconds>                 Target scan timeout
-      -p <count>                    Deauth packets
-      -TID <essid>                  Target ESSID (for target mode)
-      -MS <count>                   Max scans (for map mode)
-      -MSD <seconds>                Scan duration (for map mode)
-      -GPS <path>                   GPS port (for map mode)
-      -WL <file>                    Wordlist (for process modes)
-    
-    Other:
-      -h, help                      Show this help
-      q, quit                       Exit program
-    
-    Examples:
-      collect -auto -IS 10 -TS 30
-      target -TID "MyNetwork" -IS 5
-      map -MS 50 -MSD 2
-    """
-    print(help_text)
-
-def _execute_interactive_mode(suite, mode_cmd, parsed_args, cli_state):
-    """Execute a mode command in interactive CLI"""
-    # Map command to mode
-    mode_map = {
-        'collect': 'collect',
-        'process': 'process',
-        'target': 'target',
-        'map': 'map',
-        'config': 'config',
-        'clean': 'clean'
-    }
-    
-    if mode_cmd not in mode_map:
-        suite.log(f"Unknown command: {mode_cmd}. Type 'help' for available commands.", prefix="x")
-        return
-    
-    mode_type = mode_map[mode_cmd]
-    
-    # Extract mode subtype (manual/auto)
-    mode_subtype = None
-    if 'manual' in parsed_args or parsed_args.get('m') == True:
-        mode_subtype = 'manual'
-    elif 'auto' in parsed_args or parsed_args.get('a') == True:
-        mode_subtype = 'auto'
-    elif mode_type in ['collect', 'process']:
-        mode_subtype = 'manual'  # Default to manual
-    
-    # Extract parameters
-    initial_scan = int(parsed_args.get('IS', parsed_args.get('initial-scan', suite.initial_scan)))
-    target_scan = int(parsed_args.get('TS', parsed_args.get('target-scan', suite.target_scan)))
-    packets = int(parsed_args.get('p', parsed_args.get('packets', suite.packets)))
-    
-    suite.initial_scan = initial_scan
-    suite.target_scan = target_scan
-    suite.packets = packets
-    
-    suite.log(f"MiFi VERSION 0.1.1", prefix="blank")
-    suite.log(f"MODE: {mode_type}-{mode_subtype if mode_subtype else 'direct'}", prefix="blank")
-    
-    # Print parameters
-    if mode_type in ['collect', 'target']:
-        suite.log(f"{mode_type}-{mode_subtype if mode_subtype else 'direct'} parameters:", prefix="config")
-        suite.log(f"Search:", indent=4, prefix="dot")
-        suite.log(f"Initial scan timeout: {initial_scan} seconds", indent=8, prefix="dot")
-        suite.log(f"Target:", indent=4, prefix="dot")
-        suite.log(f"Target monitor timeout: {target_scan} seconds", indent=8, prefix="dot")
-        suite.log(f"Deauth packets: {packets}", indent=8, prefix="dot")
-    
-    # Execute mode
-    try:
-        if mode_type == "config":
-            suite.configure_interface()
-        
-        elif mode_type == "collect":
-            suite.collect(
-                mode=mode_subtype,
-                packets=packets,
-                target_scan=target_scan,
-                initial_scan=initial_scan
-            )
-        
-        elif mode_type == "process":
-            wordlist = parsed_args.get('WL', parsed_args.get('wordlist', suite.word_list))
-            if wordlist and not os.path.isfile(wordlist):
-                suite.log(f"Wordlist not found: {wordlist}", prefix="x")
-                return
-            suite.word_list = wordlist
-            suite.process_all(mode=mode_subtype, word_list=wordlist)
-        
-        elif mode_type == "target":
-            target_essid = parsed_args.get('TID', parsed_args.get('target-id'))
-            if not target_essid:
-                suite.log("Target ESSID required. Use -TID <essid>", prefix="x")
-                return
-            suite.collect(
-                target_essid=target_essid,
-                target_scan_attempts=int(parsed_args.get('TSA', parsed_args.get('target-search-attempts', 25))),
-                capture_attempts=int(parsed_args.get('TA', parsed_args.get('target-attempts', 10))),
-                packets=packets,
-                target_scan=target_scan,
-                initial_scan=initial_scan
-            )
-        
-        elif mode_type == "map":
-            # Auto-detect GPS device if not provided or if default doesn't exist
-            gps_port = parsed_args.get('GPS', parsed_args.get('gps-port', suite.gps_port))
-            if not gps_port or (gps_port == "/dev/ttyUSB0" and not os.path.exists("/dev/ttyUSB0")):
-                # Try to detect actual GPS device
-                usb_devices = []
-                try:
-                    usb_devices = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
-                    usb_devices = [d for d in usb_devices if d and os.path.exists(d)]
-                    if usb_devices:
-                        gps_port = usb_devices[0]
-                        suite.log(f"Auto-detected GPS device: {gps_port}", indent=4, prefix="check")
-                except Exception:
-                    pass
-            
-            # Use default if still not found
-            if not gps_port:
-                gps_port = "/dev/ttyUSB0"
-            
-            # Use existing GPS if active, otherwise start it
-            if not cli_state.gps_active:
-                if not suite.start_gps_polling(gps_device=gps_port):
-                    suite.log("Cannot proceed without gpsd. Please start gpsd and try again.", prefix="x")
-                    return
-                cli_state.gps_active = True
-            
-            # Use existing TAK if active (always use TAK if connected, regardless of -tak flag)
-            if cli_state.tak_active and suite.tak_connected and suite.tak_socket:
-                suite.log("Using existing TAK connection", prefix="check")
-            elif suite.tak_enabled and suite.tak_connected and suite.tak_socket:
-                suite.log("Using existing TAK connection", prefix="check")
-            elif suite.tak_enabled:
-                suite.log("TAK enabled but not connected. Use 'tak' command to connect.", prefix="warning")
-            
-            max_scans = int(parsed_args.get('MS', parsed_args.get('map-scans', 25)))
-            scan_duration = float(parsed_args.get('MSD', parsed_args.get('map-scan-duration', 1.0)))
-            gps_lock_attempts = int(parsed_args.get('GLA', parsed_args.get('gps-lock-attempts', 20)))
-            gps_lock_wait = int(parsed_args.get('GLW', parsed_args.get('gps-lock-wait', 5)))
-            
-            suite.log(f"{mode_type} parameters:", prefix="config")
-            suite.log(f"Max scans: {max_scans}", indent=4, prefix="dot")
-            suite.log(f"Mapping scan duration: {scan_duration} seconds", indent=4, prefix="dot")
-            suite.log(f"GPS lock attempts: {gps_lock_attempts}", indent=4, prefix="dot")
-            suite.log(f"GPS lock wait: {gps_lock_wait} seconds", indent=4, prefix="dot")
-            suite.log(f"GPS port: {gps_port}", indent=4, prefix="dot")
-            
-            suite.start_signal_tracking(
-                max_attempts=max_scans,
-                scan_interval=scan_duration,
-                gps_lock_attempts=gps_lock_attempts,
-                gps_lock_wait=gps_lock_wait
-            )
-        
-        elif mode_type == "clean":
-            suite.clean()
-        
-    except KeyboardInterrupt:
-        suite.log("Operation cancelled by user", prefix="x")
-        raise
-    except Exception as e:
-        suite.log(f"Error in {mode_type} mode: {e}", prefix="x")
-        if suite.verbose:
-            import traceback
-            traceback.print_exc()
-        raise
-
 if __name__ == "__main__":
     __version__ = "0.2.0"
 
@@ -3783,7 +3379,7 @@ if __name__ == "__main__":
     )
     options_group.add_argument(
         "--mode",
-        choices=["config", "collect-manual", "collect-auto", "process-manual", "process-auto", "full-manual", "full-auto", "target", "map", "dashboard", "control", "clean"],
+        choices=["config", "collect-manual", "collect-auto", "process-manual", "process-auto", "full-manual", "full-auto", "target", "map", "dashboard", "clean"],
         required=False,
         help="Specific tool mode for refined behavior and use-case. If omitted, starts interactive CLI server."
     )
@@ -4011,15 +3607,12 @@ if __name__ == "__main__":
     if args.headless and not is_running_under_nohup():
         reexec_with_nohup()
     
-    # Interactive CLI server mode (no --mode specified)
+    # overwatch branch: no interactive CLI REPL. --mode is required for every
+    # invocation (dashboard mode, or any direct mode for pct exec debugging).
     if not args.mode:
-        suite = wifi_cracker()
-        suite.verbose = args.verbose  # Apply global verbose setting
-        suite.debug = args.debug if hasattr(args, 'debug') else False  # Apply debug setting
-        suite.headless = args.headless
-        _run_interactive_cli(suite, __version__)
-        sys.exit(0)
-    
+        parser.error("--mode is required (interactive CLI removed in the overwatch branch). "
+                     "Use --mode dashboard, or a specific mode for direct/debug invocation.")
+
     try:
         if '-' in args.mode:
             mode_type, mode_subtype = args.mode.split('-')
@@ -4171,12 +3764,7 @@ if __name__ == "__main__":
                     suite.log("Cannot proceed without gpsd. Please start gpsd and try again.", prefix="x")
                     sys.exit(1)
                 gps_started_by_map_mode = True
-            # GPS serial initialization is optional - gps3 handles GPS via gpsd
-            # Only initialize serial if needed (currently not required for map mode)
-            # suite.init_gps() is called but failure is non-fatal since gps3 works via gpsd
-            if not suite.gps_serial:
-                suite.init_gps(port=gps_device)
-                # Don't exit on failure - gps3 via gpsd should work
+            # gps_serial/init_gps removed in overwatch branch — gps3 via gpsd is the only path
             
             # TAK: Initialize TAK connection if enabled (CLI args override config/config.ini)
             # TAK should work independently in CLI mode - no dependency on dashboard

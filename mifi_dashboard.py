@@ -53,7 +53,6 @@ def debug_print(msg, prefix='[DEBUG]', indent=0):
 
 # Global state for control panel
 mifi_process = None
-map_thread = None  # Track map mode thread for stopping
 mifi_log_queue = queue.Queue()
 prompt_queue = queue.Queue()  # For interactive prompts
 prompt_responses = {}  # Store responses to prompts
@@ -1087,114 +1086,12 @@ def api_start():
             print(f"[ERROR] Failed to initialize mifi_service: {e}")
             return jsonify({'success': False, 'error': f'Failed to initialize service: {e}'}), 500
     
-    # For map mode, call start_signal_tracking directly instead of spawning subprocess
-    if mode == 'map':
-        try:
-            # Set verbose if requested
-            mifi_service.verbose = data.get('verbose', False)
-            
-            # Get map parameters
-            max_scans = int(data.get('max_scans', 25))
-            scan_duration = float(data.get('scan_duration', 1.0))
-            gps_lock_attempts = int(data.get('gps_lock_attempts', 20))
-            gps_lock_wait = int(data.get('gps_lock_wait', 5))
-            
-            # Auto-detect GPS device if GPS is enabled
-            gps_port = data.get('gps_port')
-            if not gps_port:
-                if mifi_service.gps_thread and mifi_service.gps_thread.is_alive():
-                    usb_devices = []
-                    try:
-                        usb_devices = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
-                        usb_devices = [d for d in usb_devices if d and os.path.exists(d)]
-                        if usb_devices:
-                            gps_port = usb_devices[0]
-                    except Exception:
-                        pass
-            
-            # Ensure GPS is running
-            if not mifi_service.gps_thread or not mifi_service.gps_thread.is_alive():
-                if gps_port:
-                    if not mifi_service.start_gps_polling(gps_device=gps_port):
-                        return jsonify({'success': False, 'error': 'Cannot proceed without GPS. Please enable GPS first.'}), 400
-                else:
-                    return jsonify({'success': False, 'error': 'GPS not enabled. Please enable GPS first.'}), 400
-            
-            # Ensure interface is configured
-            mifi_service.configure_interface()
-            
-            # Set up log callback to capture logs from mifi_service
-            def log_callback(parsed_log):
-                """Callback to capture logs from mifi_service and send to dashboard"""
-                try:
-                    mifi_log_queue.put(parsed_log)
-                except Exception:
-                    pass
-            
-            # Set the log callback
-            mifi_service.log_callback = log_callback
-            
-            # Run map mode in a background thread using the same mifi_service instance
-            def run_map_mode():
-                try:
-                    mifi_service.start_signal_tracking(
-                        max_attempts=max_scans,
-                        scan_interval=scan_duration,
-                        gps_lock_attempts=gps_lock_attempts,
-                        gps_lock_wait=gps_lock_wait
-                    )
-                except Exception as e:
-                    error_log = {
-                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                        'message': f'Map mode error: {e}',
-                        'level': 'error',
-                        'prefix': '[!]'
-                    }
-                    mifi_log_queue.put(error_log)
-                    print(f"[ERROR] Map mode error: {e}")
-                    import traceback
-                    traceback.print_exc()
-                finally:
-                    # Ensure interface is up (but keep it in monitor mode between executions)
-                    try:
-                        if mifi_service:
-                            mifi_service._ensure_interface_up()
-                    except Exception as e:
-                        error_log = {
-                            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                            'message': f'Interface check note: {e}',
-                            'level': 'warning',
-                            'prefix': '[!]'
-                        }
-                        mifi_log_queue.put(error_log)
-                    
-                    # Clear log callback when done
-                    if mifi_service:
-                        mifi_service.log_callback = None
-                    mifi_status['running'] = False
-                    mifi_status['mode'] = None
-                    mifi_status['pid'] = None
-                    # GPS status should remain as-is after map mode completes
-                    # Don't modify GPS status here - it's managed by the GPS toggle
-            
-            # Start map mode in background thread
-            global map_thread
-            map_thread = threading.Thread(target=run_map_mode, daemon=True)
-            map_thread.start()
-            
-            mifi_status['running'] = True
-            mifi_status['mode'] = mode
-            mifi_status['pid'] = os.getpid()  # Use current process PID
-            mifi_status['start_time'] = datetime.now().isoformat()
-            
-            return jsonify({'success': True, 'pid': mifi_status['pid']})
-        except Exception as e:
-            print(f"[ERROR] Failed to start map mode: {e}")
-            import traceback
-            traceback.print_exc()
-            return jsonify({'success': False, 'error': str(e)}), 500
-    
-    # For other modes, still use subprocess (they may need different handling)
+    # overwatch branch: map mode now uses the same subprocess path as every
+    # other mode (see below) for lifecycle/PID consistency with the USB
+    # arbiter. The CLI subprocess already self-manages GPS via gps3/gpsd and
+    # the MIFI_GPS_ACTIVE env var (see mifi.py mode_type == "map" handling),
+    # so no in-process special case is needed here anymore.
+
     # Use sudo -E to preserve environment variables
     cmd = ['sudo', '-E', 'python3', '-u', os.path.join(os.path.dirname(__file__), 'mifi.py'), '--mode', mode]
     
@@ -1329,33 +1226,10 @@ def api_start():
 
 @app.route('/api/stop', methods=['POST'])
 def api_stop():
-    """Stop current operation - stops thread-based map mode or subprocess"""
-    global mifi_process, map_thread, mifi_service
-    
-    # Check if map mode is running in a thread
-    if map_thread and map_thread.is_alive():
-        try:
-            # Stop tracking by setting tracking_active to False
-            if mifi_service:
-                mifi_service.tracking_active = False
-                # Wait a moment for the loop to check the flag
-                time.sleep(0.5)
-                # Ensure interface is up (but keep it in monitor mode between executions)
-                try:
-                    mifi_service._ensure_interface_up()
-                except Exception as e:
-                    # Log but don't fail - interface check is best effort
-                    print(f"[WARNING] Interface check note: {e}")
-            
-            mifi_status['running'] = False
-            mifi_status['mode'] = None
-            mifi_status['pid'] = None
-            
-            return jsonify({'success': True})
-        except Exception as e:
-            return jsonify({'success': False, 'error': str(e)})
-    
-    # Fallback to subprocess handling (for legacy support)
+    """Stop the currently running MiFi operation (subprocess-based for all modes)."""
+    global mifi_process, mifi_service
+
+    # All modes (including map, as of the overwatch branch) run as a subprocess.
     if mifi_process and mifi_process.poll() is None:
         try:
             # Send SIGINT (like Ctrl+C) for clean shutdown
