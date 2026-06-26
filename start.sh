@@ -953,7 +953,7 @@ check_wifi_interface() {
     print_status "Checking for WiFi interfaces..."
     
     if command_exists iw; then
-        INTERFACES=$(iw dev 2>/dev/null | grep -E "^Interface" | awk '{print $2}')
+        INTERFACES=$(iw dev 2>/dev/null | grep -E "Interface" | awk '{print $2}')
         if [ -z "$INTERFACES" ]; then
             print_warning "No wireless interfaces detected"
             print_info "Make sure your WiFi adapter is connected and drivers are installed"
