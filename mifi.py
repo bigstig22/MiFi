@@ -58,6 +58,9 @@ class wifi_cracker:
 
         # GPS tracking variables
         self.gps_port = None
+        # overwatch branch: network gpsd target, overridable via config/config.ini [GPS]
+        self.gps_network_host = "10.0.0.2"
+        self.gps_network_port = 2947
         self.tracking_active = False
         self.tracked_essid = None
         self.tracked_bssid = None
@@ -149,6 +152,8 @@ class wifi_cracker:
     def initial_config(self):
         self.check_and_create_directories()
         self.init_database()
+        # Load GPS network target (host/port) from config/config.ini
+        self.load_gps_config()
         # Load TAK configuration from config/config.ini
         self.load_tak_config()
 
@@ -1460,10 +1465,16 @@ class wifi_cracker:
     # NOTE (overwatch branch): direct-serial GPS init removed. GPS is provided
     # exclusively via gpsd over the network (10.0.0.2:2947) — see start_gps_polling().
 
-    def check_gpsd_running(self, gps_host="10.0.0.2", gps_port=2947):
+    def check_gpsd_running(self, gps_host=None, gps_port=None):
         """
         Check if gpsd is running and accessible.
+        Defaults to the configured network gpsd target (self.gps_network_host/port,
+        loaded from config/config.ini [GPS] — see load_gps_config()) if not overridden.
         """
+        if gps_host is None:
+            gps_host = getattr(self, "gps_network_host", "10.0.0.2")
+        if gps_port is None:
+            gps_port = getattr(self, "gps_network_port", 2947)
         try:
             import socket
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1474,14 +1485,20 @@ class wifi_cracker:
         except Exception:
             return False
 
-    def start_gps_polling(self, gps_host="10.0.0.2", gps_port=2947, poll_interval=0.5, gps_device=None):
+    def start_gps_polling(self, gps_host=None, gps_port=None, poll_interval=0.5, gps_device=None):
         """
         Starts a background thread that polls gpsd for the latest GPS fix every poll_interval seconds using gps3.
         Continuously updates the latest GPS position as new data arrives.
         
         Args:
+            gps_host/gps_port: network gpsd target. Defaults to the configured
+                self.gps_network_host/port (config/config.ini [GPS]) if not overridden.
             gps_device: USB device path (e.g., /dev/ttyUSB0) - used for gpsd setup instructions if not running
         """
+        if gps_host is None:
+            gps_host = getattr(self, "gps_network_host", "10.0.0.2")
+        if gps_port is None:
+            gps_port = getattr(self, "gps_network_port", 2947)
         self.log("GPS", prefix="config")
         
         # Check for USB GPS devices first
@@ -2357,6 +2374,26 @@ class wifi_cracker:
         
         self.log(f"Tracking data exported to {filename}", prefix="check")
         return filename
+
+    def load_gps_config(self):
+        """
+        Load the network gpsd target (host/port) from config/config.ini [GPS].
+        overwatch branch: GPS is always a network gpsd client (no local serial
+        GPS device) — see GPS.md. Falls back to the OVERWATCH PVE host defaults
+        (10.0.0.2:2947) if no [GPS] section or values are present.
+        """
+        if not os.path.exists("config/config.ini"):
+            return
+
+        config = configparser.ConfigParser()
+        config.read("config/config.ini")
+
+        if "GPS" in config:
+            gps_config = config["GPS"]
+            host = gps_config.get("host", "").strip()
+            if host:
+                self.gps_network_host = host
+            self.gps_network_port = gps_config.getint("port", fallback=self.gps_network_port)
 
     def load_tak_config(self):
         """

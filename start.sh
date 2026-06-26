@@ -154,10 +154,10 @@ install_system_packages() {
                 "hashcat"
                 "python3"
                 "python3-pip"
-                "gpsd"
                 "gpsd-clients"
                 "iw"
                 "wireless-tools"
+                "netcat-openbsd"
             )
             
             print_info "Detected: $DISTRO $VERSION"
@@ -724,34 +724,57 @@ download_rockyou() {
 
 # Function to setup GPS
 setup_gps() {
-    print_status "Setting up GPS (gpsd)..."
-    
-    if ! command_exists gpsd; then
-        print_warning "gpsd not installed, skipping GPS setup"
+    print_status "Configuring GPS (network gpsd source)..."
+    print_info "GPS is provided by a network gpsd service, not a USB GPS device on this machine."
+    print_info "This just needs the IP/port of wherever gpsd is actually running."
+
+    # Pull current values out of config.ini if it exists, else use defaults
+    GPS_HOST="10.0.0.2"
+    GPS_PORT="2947"
+    if [ -f "config/config.ini" ]; then
+        existing_host=$(awk -F'=' '/^\[GPS\]/{f=1} f&&/^host/{print $2; exit}' config/config.ini | xargs)
+        existing_port=$(awk -F'=' '/^\[GPS\]/{f=1} f&&/^port/{print $2; exit}' config/config.ini | xargs)
+        [ -n "$existing_host" ] && GPS_HOST="$existing_host"
+        [ -n "$existing_port" ] && GPS_PORT="$existing_port"
+    fi
+
+    read -p "GPS source IP/host [$GPS_HOST]: " input_host
+    read -p "GPS source port [$GPS_PORT]: " input_port
+    GPS_HOST="${input_host:-$GPS_HOST}"
+    GPS_PORT="${input_port:-$GPS_PORT}"
+
+    # Write the values back into config.ini's [GPS] section
+    if [ -f "config/config.ini" ]; then
+        python3 - "$GPS_HOST" "$GPS_PORT" << 'PYEOF'
+import configparser, sys
+host, port = sys.argv[1], sys.argv[2]
+config = configparser.ConfigParser()
+config.read("config/config.ini")
+if "GPS" not in config:
+    config["GPS"] = {}
+config["GPS"]["host"] = host
+config["GPS"]["port"] = port
+with open("config/config.ini", "w") as f:
+    config.write(f)
+PYEOF
+        print_info "Saved GPS source to config/config.ini: ${GPS_HOST}:${GPS_PORT}"
+    fi
+
+    # Confirm reachability (non-fatal either way — just informational)
+    if command_exists nc; then
+        if nc -z -w3 "$GPS_HOST" "$GPS_PORT" 2>/dev/null; then
+            print_status "GPS source reachable at ${GPS_HOST}:${GPS_PORT}"
+            return 0
+        else
+            print_warning "Cannot reach ${GPS_HOST}:${GPS_PORT} right now. Saved anyway — confirm the gpsd service is running there."
+            return 1
+        fi
+    else
+        print_warning "nc not installed, skipping GPS reachability check (non-fatal)"
         return 1
     fi
-    
-    # Check if gpsd is running
-    if systemctl is-active --quiet gpsd 2>/dev/null; then
-        print_info "gpsd service is already running"
-    else
-        print_info "Starting gpsd service..."
-        sudo systemctl start gpsd 2>/dev/null || {
-            print_warning "Could not start gpsd service (may need manual configuration)"
-        }
-    fi
-    
-    # Enable gpsd on boot
-    sudo systemctl enable gpsd 2>/dev/null || {
-        print_warning "Could not enable gpsd on boot"
-    }
-    
-    print_info "GPS setup complete. To use GPS, connect your USB GPS device and run:"
-    print_info "  sudo gpsd /dev/ttyUSB0 -F /var/run/gpsd.sock"
-    print_info "  Or configure /etc/default/gpsd with your device path"
-    
-    return 0
 }
+
 
 # Function to create config.ini if it doesn't exist
 create_config() {
@@ -773,6 +796,13 @@ create_config() {
 # Monitor mode interface candidates (comma-separated)
 # The tool will automatically detect and use these interfaces
 monitor_candidates = wlan1,wlp0s20f0u2
+
+[GPS]
+# overwatch branch: GPS is provided by a network gpsd service (not a local
+# USB GPS device attached to this machine). host/port point at wherever
+# gpsd is actually running and reachable on your network.
+host = 10.0.0.2
+port = 2947
 
 [TAK]
 # TAK Server Configuration
@@ -1033,12 +1063,12 @@ main() {
     download_rockyou || print_warning "rockyou.txt not available (optional)"
     echo ""
     
-    # Step 7: Setup GPS
-    setup_gps || print_warning "GPS setup incomplete (optional)"
+    # Step 7: Create config
+    create_config
     echo ""
     
-    # Step 8: Create config
-    create_config
+    # Step 8: Setup GPS
+    setup_gps || print_warning "GPS setup incomplete (optional)"
     echo ""
     
     # Step 9: Setup TAK configuration (optional)
