@@ -774,6 +774,11 @@ def api_config():
                 result['interface'] = {
                     'candidates': config['DEFAULT'].get('monitor_candidates', '')
                 }
+            if 'GPS' in config:
+                result['gps'] = {
+                    'host': config['GPS'].get('host', '10.0.0.2'),
+                    'port': config['GPS'].getint('port', 2947)
+                }
             
             return jsonify(result)
         except Exception as e:
@@ -1123,8 +1128,7 @@ def api_start():
             cmd.extend(['-MS', str(data['max_scans'])])
         if data.get('scan_duration'):
             cmd.extend(['-MSD', str(data['scan_duration'])])
-        # overwatch branch: no local USB GPS device -- always pass .gps-stub to satisfy
-        # mifi.py's os.path.exists() gate; real GPS data comes from network gpsd.
+        # overwatch: always pass .gps-stub to satisfy os.path.exists() gate in mifi.py
         gps_port = data.get('gps_port') or os.path.join(os.path.dirname(__file__), '.gps-stub')
         cmd.extend(['-GPS', gps_port])
         if data.get('gps_lock_attempts'):
@@ -1981,8 +1985,10 @@ def _process_log_line(process, line, line_count, recent_prompts=None):
         # TAK CoT sending is now handled entirely in mifi.py
         # The dashboard only displays logs - all TAK functionality is in mifi.py
         
-        # Queueing log line (debug output removed)
-        mifi_log_queue.put(parsed)
+        # overwatch: defer the initial queue.put until after prompt detection
+        # to avoid double-queuing prompt lines (they get put once below with
+        # prompt data already attached, rather than once bare + once with data).
+        _queued_already = False
         
         line_lower = line.lower().strip()
         line_stripped = line.strip()
@@ -2069,7 +2075,11 @@ def _process_log_line(process, line, line_count, recent_prompts=None):
             if not parsed.get('message') or not parsed['message'].strip():
                 parsed['message'] = prompt_msg
             mifi_log_queue.put(parsed)
+            _queued_already = True
             # Prompt queued for immediate delivery (debug output removed)
+        # Non-prompt lines: queue now (was deferred above to avoid double-queue)
+        if not _queued_already:
+            mifi_log_queue.put(parsed)
     except Exception as e:
         error_msg = f'Error processing log line: {str(e)}'
         print(f"[ERROR] {error_msg}")
@@ -2469,9 +2479,7 @@ def api_gps_toggle():
             return jsonify({'success': True, 'enabled': False, 'details': status_details})
         else:
             # Enable GPS monitoring
-            # overwatch branch: GPS is a network gpsd client (10.0.0.2:2947 by
-            # default, configurable in config/config.ini [GPS]) -- no local USB
-            # GPS device to check for; go straight to start_gps_polling().
+            # overwatch branch: GPS is network gpsd -- no local USB device check needed
             if verbose_requested:
                 mifi_service.verbose = True
             if mifi_service.start_gps_polling():
@@ -6331,8 +6339,11 @@ def index():
                             <input type="number" id="scanDuration" value="1" min="1" step="0.1">
                         </div>
                         <div class="form-group">
-                            <label>GPS Port (-GPS)</label>
-                            <input type="text" id="gpsPort" value="/dev/ttyUSB0" placeholder="/dev/ttyUSB0">
+                            <label>GPS Source</label>
+                            <input type="text" id="gpsPort" value="" readonly
+                                   placeholder="Loading from config..."
+                                   title="GPS source is configured in config/config.ini [GPS]. Edit there to change.">
+                            <small style="color:#888">Configured via config/config.ini &mdash; read-only here.</small>
                         </div>
                         <div class="form-group">
                             <label>GPS Lock Attempts (-GLA)</label>
@@ -7263,6 +7274,11 @@ def index():
                     }
                     if (data.interface) {
                         document.getElementById('monitorCandidates').value = data.interface.candidates || '';
+                    }
+                    // Populate GPS source field from config (overwatch branch: always network gpsd)
+                    if (data.gps) {
+                        const gpsField = document.getElementById('gpsPort');
+                        if (gpsField) gpsField.value = data.gps.host + ':' + data.gps.port;
                     }
                 });
         }
