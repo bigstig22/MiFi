@@ -1128,7 +1128,6 @@ def api_start():
             cmd.extend(['-MS', str(data['max_scans'])])
         if data.get('scan_duration'):
             cmd.extend(['-MSD', str(data['scan_duration'])])
-        # overwatch: always pass .gps-stub to satisfy os.path.exists() gate in mifi.py
         gps_port = os.path.join(os.path.dirname(__file__), '.gps-stub')
         cmd.extend(['-GPS', gps_port])
         if data.get('gps_lock_attempts'):
@@ -1140,13 +1139,7 @@ def api_start():
         # Set environment to ensure unbuffered output
         env = os.environ.copy()
         env['PYTHONUNBUFFERED'] = '1'
-        
-        # Tell the subprocess whether GPS polling is active in the dashboard process.
-        # map mode uses this to decide whether to start its own gpsd polling thread
-        # (it always needs one since it runs as a separate process) without warning
-        # the user that "GPS is not active" — the dashboard toggle already handled that.
-        gps_active = (mifi_service and mifi_service.gps_thread
-                      and mifi_service.gps_thread.is_alive())
+        gps_active = (mifi_service and mifi_service.gps_thread and mifi_service.gps_thread.is_alive())
         env['MIFI_GPS_ACTIVE'] = '1' if gps_active else '0'
         
         # Use pty (pseudo-terminal) on Unix to make process think it's connected to a terminal
@@ -1949,6 +1942,13 @@ def _process_log_line(process, line, line_count, recent_prompts=None):
         
         # Filter out verbose initialization and directory checking messages
         message_lower = message.lower()
+        
+        # Pre-filter: structural patterns that are always raw iw/ip-link output
+        # e.g. '5: wlan0: <BROADCAST,ALLMULTI,PROMISC,...>' lines from ip link show
+        import re as _re
+        if _re.match(r'^\d+:\s+\w+:', message) or _re.match(r'^\s*\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+', message):
+            return  # raw ip link / TXQ stats line
+        
         if any(skip in message_lower for skip in [
             'checking system directory structure',
             "base directory '",
@@ -1965,13 +1965,12 @@ def _process_log_line(process, line, line_count, recent_prompts=None):
             'response submitted:',
             'exiting manual mode...',
             'mode: collect-manual complete',
-            # Filter airmon verbose output that crashes webapp logs
+            # Filter airmon/iw/ip-link raw verbose output
             'phy#',
-            'interface',
             'driver',
             'chipset',
-            'monitor mode',
-            'managed mode',
+            'monitor mode enabled',
+            'managed mode enabled',
             'txpower',
             'ieee 802.11',
             'frequency:',
@@ -1979,7 +1978,28 @@ def _process_log_line(process, line, line_count, recent_prompts=None):
             'retry',
             'rts thr:',
             'fragment thr:',
-            'power management:'
+            'power management:',
+            # Raw iw dev output lines
+            'ifindex ',
+            'wdev 0x',
+            'qsz-byt',
+            'qsz-pkt',
+            'multicast txq',
+            'link/ieee802.11',
+            'broadcast,allmulti',
+            'notrailers',
+            'link/ether',
+            'center1:',
+            'rtw_8812au',
+            # GPS internal polling debug lines
+            'gps tpv data:',
+            'gps mode=0',
+            'gps mode=1',
+            'gps attempting lock:',
+            'gps receiving valid coordinates:',
+            'gps polling thread started',
+            # .gps-stub implementation detail
+            '.gps-stub',
         ]):
             # Skip verbose messages but still process prompts
             if not any(prompt_indicator in message_lower for prompt_indicator in [
@@ -2480,8 +2500,7 @@ def api_gps_toggle():
             }
             return jsonify({'success': True, 'enabled': False, 'details': status_details})
         else:
-            # Enable GPS monitoring
-            # overwatch branch: GPS is network gpsd -- no local USB device check needed
+            # Enable GPS monitoring (network gpsd -- no local USB device check)
             if verbose_requested:
                 mifi_service.verbose = True
             if mifi_service.start_gps_polling():
@@ -6344,7 +6363,7 @@ def index():
                             <label>GPS Source</label>
                             <input type="text" id="gpsPort" value="" readonly
                                    placeholder="Loading from config..."
-                                   title="GPS source is configured in config/config.ini [GPS]. Edit there to change.">
+                                   title="GPS source is configured in config/config.ini [GPS].">
                             <small style="color:#888">Configured via config/config.ini &mdash; read-only here.</small>
                         </div>
                         <div class="form-group">
@@ -7827,8 +7846,7 @@ def index():
             if (mode === 'map') {
                 params.max_scans = document.getElementById('maxScans').value;
                 params.scan_duration = document.getElementById('scanDuration').value;
-                // gps_port intentionally not sent — backend always uses .gps-stub
-                // (overwatch: GPS comes from network gpsd, not a local device path)
+                // gps_port intentionally not sent -- backend always uses .gps-stub
                 params.gps_lock_attempts = document.getElementById('gpsLockAttempts').value;
                 params.gps_lock_wait = document.getElementById('gpsLockWait').value;
             }

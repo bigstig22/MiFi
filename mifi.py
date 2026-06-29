@@ -1502,9 +1502,7 @@ class wifi_cracker:
         self.log("GPS", prefix="config")
         
         # Only check physical device existence for real /dev/ paths.
-        # Stub files (.gps-stub) and network strings (host:port) are not
-        # device nodes — skip the gate and let check_gpsd_running() be the
-        # real arbiter of GPS availability. (overwatch: no local USB GPS.)
+        # Stub files and network strings skip this gate.
         if gps_device and gps_device.startswith('/dev/'):
             if not os.path.exists(gps_device):
                 self.log(f"GPS device {gps_device} not found.", prefix="error", indent=4)
@@ -1547,7 +1545,10 @@ class wifi_cracker:
                     self.gps_status_callback('searching')
         def poll():
             if self.verbose:
-                self.log(f"GPS polling thread started for device: {gps_device}", indent=4, prefix="dot")
+                gps_device_display = (f"{gps_host}:{gps_port}"
+                                       if gps_device and '.gps-stub' in str(gps_device)
+                                       else (gps_device or f"{gps_host}:{gps_port}"))
+                self.log(f"GPS polling thread started for device: {gps_device_display}", indent=4, prefix="dot")
             gps_socket = None
             data_stream = None
             try:
@@ -3721,7 +3722,10 @@ if __name__ == "__main__":
                 suite.log(f"GPS lock attempts: {args.gps_lock_attempts}", indent=4, prefix="dot")
                 suite.log(f"GPS lock wait: {args.gps_lock_wait} seconds", indent=4, prefix="dot")
                 if args.gps_port:
-                    suite.log(f"GPS port: {args.gps_port}", indent=4, prefix="dot")
+                    gps_display = (f"{suite.gps_network_host}:{suite.gps_network_port}"
+                                   if '.gps-stub' in str(args.gps_port)
+                                   else args.gps_port)
+                    suite.log(f"GPS port: {gps_display}", indent=4, prefix="dot")
 
         print_mode_parameters()
 
