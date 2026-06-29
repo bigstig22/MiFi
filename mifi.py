@@ -1501,8 +1501,11 @@ class wifi_cracker:
             gps_port = getattr(self, "gps_network_port", 2947)
         self.log("GPS", prefix="config")
         
-        # Check for USB GPS devices first
-        if gps_device:
+        # Only check physical device existence for real /dev/ paths.
+        # Stub files (.gps-stub) and network strings (host:port) are not
+        # device nodes — skip the gate and let check_gpsd_running() be the
+        # real arbiter of GPS availability. (overwatch: no local USB GPS.)
+        if gps_device and gps_device.startswith('/dev/'):
             if not os.path.exists(gps_device):
                 self.log(f"GPS device {gps_device} not found.", prefix="error", indent=4)
                 with self.gps_lock:

@@ -1129,7 +1129,7 @@ def api_start():
         if data.get('scan_duration'):
             cmd.extend(['-MSD', str(data['scan_duration'])])
         # overwatch: always pass .gps-stub to satisfy os.path.exists() gate in mifi.py
-        gps_port = data.get('gps_port') or os.path.join(os.path.dirname(__file__), '.gps-stub')
+        gps_port = os.path.join(os.path.dirname(__file__), '.gps-stub')
         cmd.extend(['-GPS', gps_port])
         if data.get('gps_lock_attempts'):
             cmd.extend(['-GLA', str(data['gps_lock_attempts'])])
@@ -1141,8 +1141,13 @@ def api_start():
         env = os.environ.copy()
         env['PYTHONUNBUFFERED'] = '1'
         
-        # For non-map modes, pass environment variables if needed
-        # (Map mode now runs directly in mifi_service, so no env vars needed)
+        # Tell the subprocess whether GPS polling is active in the dashboard process.
+        # map mode uses this to decide whether to start its own gpsd polling thread
+        # (it always needs one since it runs as a separate process) without warning
+        # the user that "GPS is not active" — the dashboard toggle already handled that.
+        gps_active = (mifi_service and mifi_service.gps_thread
+                      and mifi_service.gps_thread.is_alive())
+        env['MIFI_GPS_ACTIVE'] = '1' if gps_active else '0'
         
         # Use pty (pseudo-terminal) on Unix to make process think it's connected to a terminal
         # This ensures prompts are flushed immediately (no buffering)
@@ -1985,9 +1990,7 @@ def _process_log_line(process, line, line_count, recent_prompts=None):
         # TAK CoT sending is now handled entirely in mifi.py
         # The dashboard only displays logs - all TAK functionality is in mifi.py
         
-        # overwatch: defer the initial queue.put until after prompt detection
-        # to avoid double-queuing prompt lines (they get put once below with
-        # prompt data already attached, rather than once bare + once with data).
+        # Defer initial queue.put until after prompt detection to avoid double-queuing
         _queued_already = False
         
         line_lower = line.lower().strip()
@@ -2077,7 +2080,6 @@ def _process_log_line(process, line, line_count, recent_prompts=None):
             mifi_log_queue.put(parsed)
             _queued_already = True
             # Prompt queued for immediate delivery (debug output removed)
-        # Non-prompt lines: queue now (was deferred above to avoid double-queue)
         if not _queued_already:
             mifi_log_queue.put(parsed)
     except Exception as e:
@@ -7275,7 +7277,6 @@ def index():
                     if (data.interface) {
                         document.getElementById('monitorCandidates').value = data.interface.candidates || '';
                     }
-                    // Populate GPS source field from config (overwatch branch: always network gpsd)
                     if (data.gps) {
                         const gpsField = document.getElementById('gpsPort');
                         if (gpsField) gpsField.value = data.gps.host + ':' + data.gps.port;
@@ -7826,7 +7827,8 @@ def index():
             if (mode === 'map') {
                 params.max_scans = document.getElementById('maxScans').value;
                 params.scan_duration = document.getElementById('scanDuration').value;
-                params.gps_port = document.getElementById('gpsPort').value;
+                // gps_port intentionally not sent — backend always uses .gps-stub
+                // (overwatch: GPS comes from network gpsd, not a local device path)
                 params.gps_lock_attempts = document.getElementById('gpsLockAttempts').value;
                 params.gps_lock_wait = document.getElementById('gpsLockWait').value;
             }
