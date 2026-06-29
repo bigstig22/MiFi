@@ -190,7 +190,7 @@ class wifi_cracker:
             elif base_iface in all_interfaces:
                 self.log(f"Found base interface {base_iface}, enabling monitor mode...", indent=4, prefix="-")
                 try:
-                    self.coms(f'airmon-ng start {base_iface}')
+                    self.coms(f'sudo airmon-ng start {base_iface}')
                     new_mon_iface = self._find_monitor_interface()
                     if new_mon_iface:
                         self.interface = new_mon_iface
@@ -221,16 +221,16 @@ class wifi_cracker:
         if not self.headless:
             try:
                 iface = input("Enter your wireless interface to put into monitor mode (e.g., wlan1): ").strip()
-            except KeyboardInterrupt:
-                self.log("User aborted input. Exiting.", prefix="x")
-                sys.exit(1)
+            except (KeyboardInterrupt, EOFError):
+                self.log("No TTY input available or user aborted. Set monitor_candidates in config/config.ini.", prefix="x")
+                return False
 
             if iface not in base_ifaces:
                 self.log(f"Invalid interface selected: {iface}", prefix="x")
                 sys.exit(1)
 
             try:
-                self.coms(f'airmon-ng start {iface}')
+                self.coms(f'sudo airmon-ng start {iface}')
                 mon_iface = self._find_monitor_interface()
                 if mon_iface:
                     self.interface = mon_iface

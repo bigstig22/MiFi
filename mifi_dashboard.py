@@ -1123,11 +1123,8 @@ def api_start():
             cmd.extend(['-MS', str(data['max_scans'])])
         if data.get('scan_duration'):
             cmd.extend(['-MSD', str(data['scan_duration'])])
-        # overwatch branch: there is no local USB GPS device in this container —
-        # GPS comes from network gpsd (mifi_service.gps_network_host/port).
-        # -GPS only needs to satisfy mifi.py's os.path.exists() gate, so we
-        # always point it at the stub file rather than trying to auto-detect
-        # a /dev/ttyUSB*/ttyACM* device that will never be present here.
+        # overwatch branch: no local USB GPS device -- always pass .gps-stub to satisfy
+        # mifi.py's os.path.exists() gate; real GPS data comes from network gpsd.
         gps_port = data.get('gps_port') or os.path.join(os.path.dirname(__file__), '.gps-stub')
         cmd.extend(['-GPS', gps_port])
         if data.get('gps_lock_attempts'):
@@ -2160,7 +2157,7 @@ def api_interface_prompt():
             
             # Enable monitor mode
             try:
-                subprocess.run(['airmon-ng', 'start', interface_name], check=True, timeout=10)
+                subprocess.run(['sudo', 'airmon-ng', 'start', interface_name], check=True, timeout=10)
                 # Find the new monitor interface
                 result = subprocess.run(['iw', 'dev'], capture_output=True, text=True, timeout=2, check=True)
                 interfaces = re.findall(r'Interface\s+(\S+)', result.stdout)
@@ -2261,7 +2258,7 @@ def api_interface_toggle():
                 if monitor_iface:
                     # Stop monitor mode using airmon-ng
                     try:
-                        subprocess.run(['airmon-ng', 'stop', monitor_iface], check=True, timeout=10)
+                        subprocess.run(['sudo', 'airmon-ng', 'stop', monitor_iface], check=True, timeout=10)
                         log_entry = {
                             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                             'message': f'Monitor mode disabled on {monitor_iface}',
@@ -2473,15 +2470,10 @@ def api_gps_toggle():
         else:
             # Enable GPS monitoring
             # overwatch branch: GPS is a network gpsd client (10.0.0.2:2947 by
-            # default, configurable in config/config.ini [GPS]) — there is no
-            # local USB GPS device to check for, so we go straight to
-            # start_gps_polling() and let it report connectivity/fix status.
-
-            # Set verbose mode if requested
+            # default, configurable in config/config.ini [GPS]) -- no local USB
+            # GPS device to check for; go straight to start_gps_polling().
             if verbose_requested:
                 mifi_service.verbose = True
-            
-            # Start GPS polling using mifi.py's native service (network gpsd)
             if mifi_service.start_gps_polling():
                 mifi_status['gps_enabled'] = True
                 mifi_status['gps_status'] = 'searching'
@@ -2494,7 +2486,6 @@ def api_gps_toggle():
                 }
                 return jsonify({'success': True, 'enabled': True, 'details': status_details})
             else:
-                # start_gps_polling returned False - check what status it set
                 current_status = getattr(mifi_service, 'gps_status', 'no_data')
                 mifi_status['gps_status'] = current_status
                 mifi_status['gps_enabled'] = False
