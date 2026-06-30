@@ -748,8 +748,13 @@ class wifi_cracker:
             shell_mode = False
 
         if background:
-            stdout = None if verbose else subprocess.DEVNULL
-            stderr = None if verbose else subprocess.DEVNULL
+            # In verbose mode, use PIPE rather than inheriting the parent PTY (stdout=None).
+            # Inheriting the PTY causes high-frequency background tools (aireplay-ng, airodump-ng)
+            # to flood the PTY buffer, blocking the subprocess and deadlocking Flask.
+            # Their output goes to PIPE where it's simply not read (and therefore discarded),
+            # which is fine — all meaningful status comes through self.log() calls anyway.
+            stdout = subprocess.PIPE if verbose else subprocess.DEVNULL
+            stderr = subprocess.PIPE if verbose else subprocess.DEVNULL
 
             return subprocess.Popen(
                 command,
@@ -1501,8 +1506,7 @@ class wifi_cracker:
             gps_port = getattr(self, "gps_network_port", 2947)
         self.log("GPS", prefix="config")
         
-        # Only check physical device existence for real /dev/ paths.
-        # Stub files and network strings skip this gate.
+        # Only check physical device existence for real /dev/ paths
         if gps_device and gps_device.startswith('/dev/'):
             if not os.path.exists(gps_device):
                 self.log(f"GPS device {gps_device} not found.", prefix="error", indent=4)
