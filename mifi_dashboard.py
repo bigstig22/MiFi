@@ -7531,38 +7531,55 @@ def index():
         function renderCapturesTable(captures) {
             const tbody = document.getElementById('capturesTableBody');
             if (!captures.length) {
-                tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:#666;">No captures yet.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:#666; padding:20px;">No captures yet. Confirmed EAPOL handshakes will appear here after collection.</td></tr>';
                 return;
             }
             let html = '';
-            captures.forEach(cap => {
+            captures.forEach((cap, idx) => {
                 const password = cap.crack_results.length ? cap.crack_results[cap.crack_results.length - 1].password : '';
-                html += '<tr style="cursor:pointer;" onclick="toggleCaptureRow(' + cap.id + ')">' +
-                    '<td id="caret-' + cap.id + '">&#9656;</td>' +
-                    '<td>' + cap.essid + '</td>' +
-                    '<td>' + cap.bssid + '</td>' +
-                    '<td>' + (cap.channel || '') + '</td>' +
-                    '<td>' + cap.captured_at + '</td>' +
-                    '<td>' + statusBadge(cap.status) + (password ? ' <code>' + password + '</code>' : '') + '</td>' +
-                    '<td onclick="event.stopPropagation();">' +
-                        '<button class="btn btn-primary" style="padding:4px 10px; font-size:0.85em;" onclick="selectCaptureForProcessing(' + cap.id + ')">Select</button> ' +
-                        '<button class="btn btn-danger" style="padding:4px 10px; font-size:0.85em;" onclick="deleteCaptureRow(' + cap.id + ')">Delete</button>' +
-                    '</td>' +
-                '</tr>';
-                html += '<tr id="subrows-' + cap.id + '" style="display:none;"><td></td><td colspan="6">';
+                const borderTop = idx > 0 ? 'border-top:2px solid #444;' : '';
+                html += `<tr style="cursor:pointer; ${borderTop}" onclick="toggleCaptureRow(${cap.id})">` +
+                    `<td id="caret-${cap.id}" style="width:20px; color:#888; padding-right:4px;">&#9656;</td>` +
+                    `<td style="font-weight:600;">${cap.essid}</td>` +
+                    `<td style="font-family:monospace; font-size:0.88em; color:#ccc;">${cap.bssid}</td>` +
+                    `<td style="text-align:center; color:#aaa;">${cap.channel || '\u2014'}</td>` +
+                    `<td style="font-size:0.88em; color:#888;">${cap.captured_at}</td>` +
+                    `<td>${statusBadge(cap.status)}${password ? ` <code style="margin-left:6px; color:#4CAF50; font-size:0.9em;">${password}</code>` : ''}</td>` +
+                    `<td style="white-space:nowrap;" onclick="event.stopPropagation();">` +
+                        `<button class="btn btn-primary" style="padding:4px 10px; font-size:0.82em; margin-right:4px;" onclick="selectCaptureForProcessing(${cap.id})">Select</button>` +
+                        `<button class="btn btn-danger" style="padding:4px 10px; font-size:0.82em;" data-delete-id="${cap.id}" onclick="deleteCaptureRow(${cap.id})">Delete</button>` +
+                    `</td>` +
+                `</tr>`;
+
+                html += `<tr id="subrows-${cap.id}" style="display:none;">` +
+                    `<td style="border-top:1px solid #333;"></td>` +
+                    `<td colspan="6" style="border-top:1px solid #333; padding:2px 0 10px 12px; background:#1c1c1c;">`;
+
                 if (!cap.processing_runs.length) {
-                    html += '<div style="color:#666; padding:6px 0;">No processing attempts yet.</div>';
+                    html += `<div style="color:#555; font-size:0.82em; padding:4px 0 2px;">No processing attempts yet.</div>`;
                 } else {
-                    html += '<table class="data-table" style="width:100%; margin:4px 0;"><thead><tr>' +
-                        '<th>Tool</th><th>Profile</th><th>Started</th><th>Completed</th><th>Status</th></tr></thead><tbody>';
-                    cap.processing_runs.forEach(run => {
-                        html += '<tr><td>' + run.tool + '</td><td>' + (run.attack_profile || '') + '</td>' +
-                            '<td>' + run.started_at + '</td><td>' + (run.completed_at || '\u2014') + '</td>' +
-                            '<td>' + statusBadge(run.status === 'cracked' ? 'cracked' : (run.status === 'running' ? 'processing' : 'attempted')) + '</td></tr>';
+                    html += `<table style="width:100%; border-collapse:collapse; font-size:0.82em; color:#aaa;">` +
+                        `<thead><tr style="border-bottom:1px solid #2e2e2e;">` +
+                        `<th style="text-align:left; padding:3px 10px 3px 0; font-weight:400; color:#666;">Tool</th>` +
+                        `<th style="text-align:left; padding:3px 10px 3px 0; font-weight:400; color:#666;">Profile</th>` +
+                        `<th style="text-align:left; padding:3px 10px 3px 0; font-weight:400; color:#666;">Started</th>` +
+                        `<th style="text-align:left; padding:3px 10px 3px 0; font-weight:400; color:#666;">Completed</th>` +
+                        `<th style="text-align:left; padding:3px 0; font-weight:400; color:#666;">Status</th>` +
+                        `</tr></thead><tbody>`;
+                    cap.processing_runs.forEach((run, ridx) => {
+                        const runBorder = ridx > 0 ? 'border-top:1px dashed #252525;' : '';
+                        const runStatus = run.status === 'cracked' ? 'cracked' : (run.status === 'running' ? 'processing' : 'attempted');
+                        html += `<tr style="${runBorder}">` +
+                            `<td style="padding:3px 10px 3px 0;">${run.tool}</td>` +
+                            `<td style="padding:3px 10px 3px 0; color:#777;">${run.attack_profile || '\u2014'}</td>` +
+                            `<td style="padding:3px 10px 3px 0; color:#666; font-size:0.95em;">${run.started_at}</td>` +
+                            `<td style="padding:3px 10px 3px 0; color:#666; font-size:0.95em;">${run.completed_at || '\u2014'}</td>` +
+                            `<td style="padding:3px 0;">${statusBadge(runStatus)}</td>` +
+                        `</tr>`;
                     });
-                    html += '</tbody></table>';
+                    html += `</tbody></table>`;
                 }
-                html += '</td></tr>';
+                html += `</td></tr>`;
             });
             tbody.innerHTML = html;
         }
@@ -7620,16 +7637,32 @@ def index():
         }
 
         function deleteCaptureRow(id) {
-            if (!confirm('Delete this capture? The .cap file will be permanently removed.')) return;
-            fetch('/api/captures/' + id + '/delete', {method: 'POST'})
-                .then(r => r.json())
-                .then(data => {
-                    if (data.success) {
-                        loadCaptures();
-                    } else {
-                        alert('Delete failed: ' + (data.error || 'unknown error'));
+            const btn = document.querySelector(`button[data-delete-id="${id}"]`);
+            if (!btn) return;
+            if (btn.dataset.confirmPending === '1') {
+                // Second click -- actually delete
+                fetch('/api/captures/' + id + '/delete', {method: 'POST'})
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.success) {
+                            loadCaptures();
+                        } else {
+                            alert('Delete failed: ' + (data.error || 'unknown error'));
+                        }
+                    });
+            } else {
+                // First click -- arm the button
+                btn.dataset.confirmPending = '1';
+                btn.textContent = 'Confirm?';
+                btn.style.background = '#ff6600';
+                setTimeout(() => {
+                    if (btn.dataset.confirmPending === '1') {
+                        btn.dataset.confirmPending = '0';
+                        btn.textContent = 'Delete';
+                        btn.style.background = '';
                     }
-                });
+                }, 3000);
+            }
         }
 
         function renderAnalysisMap(captures) {
