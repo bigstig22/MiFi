@@ -53,8 +53,6 @@ def debug_print(msg, prefix='[DEBUG]', indent=0):
 
 # Global state for control panel
 mifi_process = None
-# Bounded queue -- on overflow (e.g. airodump-ng flood) oldest entries are
-# dropped rather than blocking the log-reading thread and deadlocking Flask.
 mifi_log_queue = queue.Queue(maxsize=500)
 prompt_queue = queue.Queue()  # For interactive prompts
 prompt_responses = {}  # Store responses to prompts
@@ -1936,28 +1934,22 @@ def read_process_logs(process, stdout_file=None):
         mifi_status['mode'] = None
         mifi_status['pid'] = None
 
-# Compiled ANSI escape sequence pattern -- strips color/cursor codes from
-# airodump-ng and other tools that do terminal screen-refresh output.
 _ANSI_RE = __import__('re').compile(r'\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
 def _queue_put_nowait(entry):
-    """Non-blocking queue put -- drops the oldest entry on overflow rather than
-    blocking the log-reading thread (which would deadlock Flask worker threads)."""
+    """Non-blocking put -- drops oldest on overflow instead of blocking."""
     try:
         mifi_log_queue.put_nowait(entry)
     except __import__('queue').Full:
         try:
-            mifi_log_queue.get_nowait()  # drop oldest
+            mifi_log_queue.get_nowait()
             mifi_log_queue.put_nowait(entry)
         except Exception:
-            pass  # queue in flux, just drop this entry
+            pass
 
 def _process_log_line(process, line, line_count, recent_prompts=None):
     """Process a single log line and detect prompts"""
     try:
-        # Strip ANSI escape codes before any processing.
-        # airodump-ng and other tools emit continuous screen-refresh sequences
-        # that corrupt JSON serialization and inflate queue volume.
         line = _ANSI_RE.sub('', line)
         if not line.strip():
             return
@@ -1967,7 +1959,7 @@ def _process_log_line(process, line, line_count, recent_prompts=None):
         # Filter out verbose initialization and directory checking messages
         message_lower = message.lower()
         
-        # Pre-filter: structural patterns that are always raw iw/ip-link output
+        # Pre-filter: structural patterns that are always raw ip-link / TXQ stats
         import re as _re2
         if _re2.match(r'^\d+:\s+\w+:', message) or _re2.match(r'^\s*\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+', message):
             return
@@ -1988,11 +1980,32 @@ def _process_log_line(process, line, line_count, recent_prompts=None):
             'response submitted:',
             'exiting manual mode...',
             'mode: collect-manual complete',
-            # Filter airodump-ng screen-refresh table output
-            'bssid',
-            'station mac',
+            # Filter airodump-ng CSV/screen-refresh output
+            'bssid, first time seen',
+            'station mac,',
             'not associated',
-            # Filter airmon/iw/ip-link raw verbose output
+            # wpapcap2john raw stdout
+            'essids processed',
+            'ap/sta pairs processed',
+            'handshakes written',
+            'rsn ie pmkids',
+            ': eof',
+            # iwconfig output lines
+            'unassociated',
+            'nickname:',
+            'mode:monitor',
+            'sensitivity:',
+            'encryption key:',
+            'link quality:',
+            'rx invalid',
+            'tx excessive',
+            'missed beacon:',
+            'access point: not-associated',
+            'frequency=',
+            # airmon-ng verbose lines
+            'mac80211 monitor mode',
+            'already enabled for',
+            # airmon/iw/ip-link raw verbose output
             'phy#',
             'driver',
             'chipset',
@@ -2036,7 +2049,6 @@ def _process_log_line(process, line, line_count, recent_prompts=None):
         # TAK CoT sending is now handled entirely in mifi.py
         # The dashboard only displays logs - all TAK functionality is in mifi.py
         
-        # Defer initial queue.put until after prompt detection to avoid double-queuing
         _queued_already = False
         
         line_lower = line.lower().strip()
@@ -2607,6 +2619,135 @@ def list_bssids():
     bssids = [row[0] for row in c.fetchall() if row[0]]
     conn.close()
     return jsonify(bssids)
+
+@app.route('/api/captures')
+def list_captures():
+    """
+    Returns the consolidated capture inventory: one entry per captures row,
+    each with its nested processing_runs (sub-rows) and any crack_results.
+    This is the data source for the Analysis tab's collapsible table and map.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute('SELECT * FROM captures ORDER BY captured_at DESC')
+    captures = [dict(row) for row in c.fetchall()]
+
+    for cap in captures:
+        c.execute('SELECT * FROM processing_runs WHERE capture_id = ? ORDER BY started_at', (cap['id'],))
+        cap['processing_runs'] = [dict(r) for r in c.fetchall()]
+        c.execute('SELECT * FROM crack_results WHERE capture_id = ? ORDER BY cracked_at', (cap['id'],))
+        cap['crack_results'] = [dict(r) for r in c.fetchall()]
+        # Derived status for the row's color/badge -- cracked takes priority,
+        # then a still-running attempt, then exhausted/failed, else untouched.
+        if cap['crack_results']:
+            cap['status'] = 'cracked'
+        elif any(r['status'] == 'running' for r in cap['processing_runs']):
+            cap['status'] = 'processing'
+        elif cap['processing_runs']:
+            cap['status'] = 'attempted'
+        else:
+            cap['status'] = 'unprocessed'
+
+    conn.close()
+    return jsonify(captures)
+
+@app.route('/api/captures/<int:capture_id>/process', methods=['POST'])
+def process_capture(capture_id):
+    """
+    Launches mifi.py --mode analyze for a single capture/tool, reusing the
+    same PTY subprocess + log-streaming infrastructure as /api/start (see
+    read_process_logs) so output appears in the Analysis tab's log panel
+    exactly like Control tab operations.
+    """
+    global mifi_process, mifi_status
+
+    if mifi_status.get('running'):
+        return jsonify({'success': False, 'error': 'Another operation is already running'}), 409
+
+    data = request.get_json() or {}
+    tool = data.get('tool')
+    if tool not in ('aircrack', 'jtr', 'hashcat'):
+        return jsonify({'success': False, 'error': 'tool must be aircrack, jtr, or hashcat'}), 400
+    word_list = data.get('wordlist', 'config/rockyou.txt')
+
+    cmd = ['sudo', '-E', 'python3', '-u', os.path.join(os.path.dirname(__file__), 'mifi.py'),
+           '--mode', 'analyze', '-CID', str(capture_id), '-TOOL', tool, '-WL', word_list]
+
+    env = os.environ.copy()
+    env['PYTHONUNBUFFERED'] = '1'
+    gps_active = (mifi_service and mifi_service.gps_thread and mifi_service.gps_thread.is_alive())
+    env['MIFI_GPS_ACTIVE'] = '1' if gps_active else '0'
+
+    try:
+        if sys.platform != 'win32':
+            master_fd, slave_fd = pty.openpty()
+            try:
+                winsize = struct.pack('HHHH', 24, 80, 0, 0)
+                fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
+            except Exception:
+                pass
+            mifi_process = subprocess.Popen(
+                cmd, stdout=slave_fd, stderr=slave_fd, stdin=slave_fd,
+                env=env, start_new_session=True
+            )
+            os.close(slave_fd)
+            process_stdout = os.fdopen(master_fd, 'r', buffering=1)
+            stdin_fd = os.dup(master_fd)
+            process_stdin = os.fdopen(stdin_fd, 'w', buffering=1)
+            mifi_process.stdin_file = process_stdin
+            mifi_process.stdout_file = process_stdout
+        else:
+            mifi_process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, stdin=subprocess.PIPE, env=env
+            )
+            process_stdout = mifi_process.stdout
+            mifi_process.stdin_file = mifi_process.stdin
+            mifi_process.stdout_file = process_stdout
+
+        mifi_status['running'] = True
+        mifi_status['mode'] = f'analyze-{tool}'
+        mifi_status['pid'] = mifi_process.pid
+        mifi_status['start_time'] = datetime.now().isoformat()
+
+        threading.Thread(target=read_process_logs, args=(mifi_process, process_stdout), daemon=True).start()
+
+        return jsonify({'success': True, 'pid': mifi_process.pid})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/captures/<int:capture_id>/delete', methods=['POST'])
+def delete_capture(capture_id):
+    """
+    Manual delete for a capture the user has given up on cracking -- removes
+    the .cap from disk and marks cap_deleted=1. Mirrors mifi.py's
+    delete_capture_file() but implemented directly here so it doesn't depend
+    on mifi_service being initialized (the Analysis tab should work even if
+    no operation has been launched yet this session).
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT cap_filename, cap_deleted FROM captures WHERE id = ?", (capture_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'success': False, 'error': 'capture not found'}), 404
+
+    cap_filename, already_deleted = row
+    if not already_deleted and cap_filename:
+        cap_path = os.path.join(os.path.dirname(__file__), 'collection', cap_filename)
+        if os.path.exists(cap_path):
+            try:
+                os.remove(cap_path)
+            except OSError as e:
+                conn.close()
+                return jsonify({'success': False, 'error': f'Failed to delete file: {e}'}), 500
+
+    c.execute("UPDATE captures SET cap_deleted = 1 WHERE id = ?", (capture_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'success': True})
 
 @app.route('/api/data')
 def get_data():
@@ -6285,6 +6426,7 @@ def index():
         <div class="tabs">
             <button class="tab active" onclick="switchTab('control', event)">Control</button>
             <button class="tab" onclick="switchTab('map', event)">Map</button>
+            <button class="tab" onclick="switchTab('analysis', event)">Analysis</button>
             <button class="tab" onclick="switchTab('config', event)">Config</button>
         </div>
 
@@ -6320,8 +6462,6 @@ def index():
                 <h2>Operation Controls</h2>
                 <div class="operation-mode-grid">
                     <button class="operation-mode-btn" id="modeCollect" data-mode="collect" onclick="selectOperationMode('collect')">Collect</button>
-                    <button class="operation-mode-btn" id="modeProcess" data-mode="process" onclick="selectOperationMode('process')">Process</button>
-                    <button class="operation-mode-btn" id="modeFull" data-mode="full" onclick="selectOperationMode('full')">Full</button>
                     <button class="operation-mode-btn" id="modeTarget" data-mode="target" onclick="selectOperationMode('target')">Target</button>
                     <button class="operation-mode-btn" id="modeMap" data-mode="map" onclick="selectOperationMode('map')">Map</button>
                     <button class="operation-mode-btn" id="modeAuto" onclick="toggleAutoMode()" disabled>Auto</button>
@@ -6360,16 +6500,6 @@ def index():
                         <div class="form-group">
                             <label>Target Capture Attempts (-TA)</label>
                             <input type="number" id="targetAttempts" value="10" min="0">
-                        </div>
-                    </div>
-                </div>
-
-                <div id="processOptions" class="mode-options" style="display: none;">
-                    <h3 style="margin-top: 20px; margin-bottom: 10px; color: #4CAF50;">Process Mode Options</h3>
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label>Wordlist Path (-WL)</label>
-                            <input type="text" id="wordlist" value="config/rockyou.txt" placeholder="config/rockyou.txt">
                         </div>
                     </div>
                 </div>
@@ -6469,6 +6599,72 @@ def index():
             </div>
         </div>
 
+        <!-- Analysis Tab -->
+        <div id="analysisTab" class="tab-content">
+            <div class="control-panel">
+                <h2>Capture Inventory</h2>
+                <div style="overflow-x:auto;">
+                    <table class="data-table" id="capturesTable" style="width:100%;">
+                        <thead>
+                            <tr>
+                                <th style="width:24px;"></th>
+                                <th>ESSID</th>
+                                <th>BSSID</th>
+                                <th>Channel</th>
+                                <th>Captured</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="capturesTableBody">
+                            <tr><td colspan="7" style="text-align:center; color:#666;">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="control-panel">
+                <h2>Process Selected Capture</h2>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Capture</label>
+                        <input type="text" id="analysisSelectedCapture" readonly placeholder="Click a row above to select">
+                    </div>
+                    <div class="form-group">
+                        <label>Tool</label>
+                        <select id="analysisToolSelect">
+                            <option value="aircrack">Aircrack-ng (wordlist, WPA2 only)</option>
+                            <option value="jtr">John the Ripper</option>
+                            <option value="hashcat">Hashcat (wordlist)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Wordlist Path</label>
+                        <input type="text" id="analysisWordlist" value="config/rockyou.txt">
+                    </div>
+                </div>
+                <div class="operation-control-buttons">
+                    <button class="btn btn-primary operation-control-btn" id="analysisExecuteBtn" onclick="executeAnalysisProcess()" disabled>Run Tool</button>
+                    <button class="btn btn-danger operation-control-btn" onclick="stopOperation()">Stop Operation</button>
+                </div>
+            </div>
+
+            <div class="control-panel">
+                <h2>Capture Locations</h2>
+                <div id="analysisMap" style="height:350px; border-radius:4px;"></div>
+                <div style="margin-top:8px; font-size:0.85em; color:#888;">
+                    <span style="color:#f44336;">&#9679;</span> Uncracked
+                    &nbsp;&nbsp;<span style="color:#ffb300;">&#9679;</span> Processing
+                    &nbsp;&nbsp;<span style="color:#4CAF50;">&#9679;</span> Cracked
+                </div>
+            </div>
+
+            <div class="control-panel">
+                <h2>Real-Time Logs</h2>
+                <div class="log-viewer" id="analysisLogViewer"></div>
+            </div>
+        </div>
+
         <!-- Map Tab -->
         <div id="mapTab" class="tab-content" style="flex-direction: column; padding: 0;">
             <div id="dashboardContainer" style="flex: 1; display: flex; flex-direction: column; width: 100%; background: #1a1a1a;">
@@ -6550,6 +6746,8 @@ def index():
                         console.error('[ERROR] loadDashboard is not a function! Type:', typeof loadDashboard);
                     }
                 }, 100);
+            } else if (tabName === 'analysis') {
+                loadCaptures();
             }
         }
 
@@ -6587,7 +6785,7 @@ def index():
             // Enable/disable Auto button based on mode
             const autoBtn = document.getElementById('modeAuto');
             if (autoBtn) {
-                if (mode === 'collect' || mode === 'process' || mode === 'full') {
+                if (mode === 'collect') {
                     autoBtn.disabled = false;
                 } else {
                     autoBtn.disabled = true;
@@ -6605,7 +6803,7 @@ def index():
                 autoModeEnabled = false;
                 document.getElementById('modeAuto').classList.remove('selected');
             } else {
-                if (currentOperationMode === 'collect' || currentOperationMode === 'process' || currentOperationMode === 'full') {
+                if (currentOperationMode === 'collect') {
                     autoModeEnabled = true;
                     document.getElementById('modeAuto').classList.add('selected');
                 }
@@ -6638,13 +6836,8 @@ def index():
             } else if (currentOperationMode === 'target') {
                 document.getElementById('collectOptions').style.display = 'block';
                 document.getElementById('targetOptions').style.display = 'block';
-            } else if (currentOperationMode === 'process') {
-                document.getElementById('processOptions').style.display = 'block';
             } else if (currentOperationMode === 'map') {
                 document.getElementById('mapOptions').style.display = 'block';
-            } else if (currentOperationMode === 'full') {
-                document.getElementById('collectOptions').style.display = 'block';
-                document.getElementById('processOptions').style.display = 'block';
             }
         }
         
@@ -7306,6 +7499,164 @@ def index():
                     }
                     window.dashboardLoading = false;
                 });
+        }
+
+        // ===================== Analysis Tab =====================
+        let analysisMapInstance = null;
+        let analysisSelectedCaptureId = null;
+        let analysisCapturesCache = [];
+
+        function loadCaptures() {
+            fetch('/api/captures')
+                .then(r => r.json())
+                .then(data => {
+                    analysisCapturesCache = data;
+                    renderCapturesTable(data);
+                    renderAnalysisMap(data);
+                })
+                .catch(e => console.error('Failed to load captures:', e));
+        }
+
+        function statusBadge(status) {
+            const map = {
+                'cracked': ['success', 'Cracked'],
+                'processing': ['warning', 'Processing'],
+                'attempted': ['warning', 'Attempted'],
+                'unprocessed': ['', 'Unprocessed']
+            };
+            const [cls, label] = map[status] || ['', status];
+            return '<span class="status-badge ' + cls + '">' + label + '</span>';
+        }
+
+        function renderCapturesTable(captures) {
+            const tbody = document.getElementById('capturesTableBody');
+            if (!captures.length) {
+                tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:#666;">No captures yet.</td></tr>';
+                return;
+            }
+            let html = '';
+            captures.forEach(cap => {
+                const password = cap.crack_results.length ? cap.crack_results[cap.crack_results.length - 1].password : '';
+                html += '<tr style="cursor:pointer;" onclick="toggleCaptureRow(' + cap.id + ')">' +
+                    '<td id="caret-' + cap.id + '">&#9656;</td>' +
+                    '<td>' + cap.essid + '</td>' +
+                    '<td>' + cap.bssid + '</td>' +
+                    '<td>' + (cap.channel || '') + '</td>' +
+                    '<td>' + cap.captured_at + '</td>' +
+                    '<td>' + statusBadge(cap.status) + (password ? ' <code>' + password + '</code>' : '') + '</td>' +
+                    '<td onclick="event.stopPropagation();">' +
+                        '<button class="btn btn-primary" style="padding:4px 10px; font-size:0.85em;" onclick="selectCaptureForProcessing(' + cap.id + ')">Select</button> ' +
+                        '<button class="btn btn-danger" style="padding:4px 10px; font-size:0.85em;" onclick="deleteCaptureRow(' + cap.id + ')">Delete</button>' +
+                    '</td>' +
+                '</tr>';
+                html += '<tr id="subrows-' + cap.id + '" style="display:none;"><td></td><td colspan="6">';
+                if (!cap.processing_runs.length) {
+                    html += '<div style="color:#666; padding:6px 0;">No processing attempts yet.</div>';
+                } else {
+                    html += '<table class="data-table" style="width:100%; margin:4px 0;"><thead><tr>' +
+                        '<th>Tool</th><th>Profile</th><th>Started</th><th>Completed</th><th>Status</th></tr></thead><tbody>';
+                    cap.processing_runs.forEach(run => {
+                        html += '<tr><td>' + run.tool + '</td><td>' + (run.attack_profile || '') + '</td>' +
+                            '<td>' + run.started_at + '</td><td>' + (run.completed_at || '\u2014') + '</td>' +
+                            '<td>' + statusBadge(run.status === 'cracked' ? 'cracked' : (run.status === 'running' ? 'processing' : 'attempted')) + '</td></tr>';
+                    });
+                    html += '</tbody></table>';
+                }
+                html += '</td></tr>';
+            });
+            tbody.innerHTML = html;
+        }
+
+        function toggleCaptureRow(id) {
+            const row = document.getElementById('subrows-' + id);
+            const caret = document.getElementById('caret-' + id);
+            if (!row) return;
+            const isOpen = row.style.display !== 'none';
+            row.style.display = isOpen ? 'none' : 'table-row';
+            caret.innerHTML = isOpen ? '&#9656;' : '&#9662;';
+        }
+
+        function selectCaptureForProcessing(id) {
+            analysisSelectedCaptureId = id;
+            const cap = analysisCapturesCache.find(c => c.id === id);
+            document.getElementById('analysisSelectedCapture').value = cap ? (cap.essid + ' (' + cap.bssid + ')') : ('Capture #' + id);
+            document.getElementById('analysisExecuteBtn').disabled = false;
+        }
+
+        function executeAnalysisProcess() {
+            if (!analysisSelectedCaptureId) return;
+            const tool = document.getElementById('analysisToolSelect').value;
+            const wordlist = document.getElementById('analysisWordlist').value;
+            document.getElementById('analysisExecuteBtn').disabled = true;
+
+            fetch('/api/captures/' + analysisSelectedCaptureId + '/process', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({tool: tool, wordlist: wordlist})
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (!data.success) {
+                    addLog('Failed to start processing: ' + (data.error || 'unknown error'), 'error');
+                    document.getElementById('analysisExecuteBtn').disabled = false;
+                } else {
+                    addLog('Processing started (tool=' + tool + ')', 'info');
+                    // Reload the inventory once the operation completes (poll status)
+                    const poll = setInterval(() => {
+                        fetch('/api/status').then(r => r.json()).then(s => {
+                            if (!s.running) {
+                                clearInterval(poll);
+                                document.getElementById('analysisExecuteBtn').disabled = false;
+                                loadCaptures();
+                            }
+                        });
+                    }, 3000);
+                }
+            })
+            .catch(e => {
+                addLog('Error starting processing: ' + e.message, 'error');
+                document.getElementById('analysisExecuteBtn').disabled = false;
+            });
+        }
+
+        function deleteCaptureRow(id) {
+            if (!confirm('Delete this capture? The .cap file will be permanently removed.')) return;
+            fetch('/api/captures/' + id + '/delete', {method: 'POST'})
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        loadCaptures();
+                    } else {
+                        alert('Delete failed: ' + (data.error || 'unknown error'));
+                    }
+                });
+        }
+
+        function renderAnalysisMap(captures) {
+            const el = document.getElementById('analysisMap');
+            if (!el) return;
+            if (!analysisMapInstance) {
+                analysisMapInstance = L.map('analysisMap', {maxZoom: 18}).setView([0, 0], 2);
+                L.tileLayer('http://10.0.1.3:8080/data/globe/{z}/{x}/{y}.png', {maxZoom: 18}).addTo(analysisMapInstance);
+            }
+            // Clear existing markers
+            analysisMapInstance.eachLayer(layer => {
+                if (layer instanceof L.CircleMarker) analysisMapInstance.removeLayer(layer);
+            });
+
+            const pts = captures.filter(c => c.gps_lat && c.gps_lon);
+            if (!pts.length) return;
+
+            pts.forEach(cap => {
+                const color = cap.status === 'cracked' ? '#4CAF50' : (cap.status === 'processing' ? '#ffb300' : '#f44336');
+                const marker = L.circleMarker([cap.gps_lat, cap.gps_lon], {
+                    radius: 8, color: color, fillColor: color, fillOpacity: 0.8, weight: 2
+                }).addTo(analysisMapInstance);
+                marker.bindPopup('<b>' + cap.essid + '</b><br>' + cap.bssid + '<br>' + statusBadge(cap.status));
+            });
+
+            const bounds = L.latLngBounds(pts.map(c => [c.gps_lat, c.gps_lon]));
+            analysisMapInstance.fitBounds(bounds, {padding: [30, 30]});
         }
 
         function loadConfig() {
@@ -8233,6 +8584,14 @@ def index():
                 entry.textContent = prefixStr + message;
                 viewer.appendChild(entry);
                 viewer.scrollTop = viewer.scrollHeight;
+            }
+
+            // Mirror into the Analysis tab's log viewer (if present) so
+            // Analysis-tab-launched operations show output there too.
+            const analysisViewer = document.getElementById('analysisLogViewer');
+            if (analysisViewer) {
+                analysisViewer.appendChild(entry.cloneNode(true));
+                analysisViewer.scrollTop = analysisViewer.scrollHeight;
             }
         }
 

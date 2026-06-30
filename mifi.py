@@ -190,7 +190,7 @@ class wifi_cracker:
             elif base_iface in all_interfaces:
                 self.log(f"Found base interface {base_iface}, enabling monitor mode...", indent=4, prefix="-")
                 try:
-                    self.coms(f'sudo airmon-ng start {base_iface}')
+                    self.coms(f'airmon-ng start {base_iface}')
                     new_mon_iface = self._find_monitor_interface()
                     if new_mon_iface:
                         self.interface = new_mon_iface
@@ -221,16 +221,16 @@ class wifi_cracker:
         if not self.headless:
             try:
                 iface = input("Enter your wireless interface to put into monitor mode (e.g., wlan1): ").strip()
-            except (KeyboardInterrupt, EOFError):
-                self.log("No TTY input available or user aborted. Set monitor_candidates in config/config.ini.", prefix="x")
-                return False
+            except KeyboardInterrupt:
+                self.log("User aborted input. Exiting.", prefix="x")
+                sys.exit(1)
 
             if iface not in base_ifaces:
                 self.log(f"Invalid interface selected: {iface}", prefix="x")
                 sys.exit(1)
 
             try:
-                self.coms(f'sudo airmon-ng start {iface}')
+                self.coms(f'airmon-ng start {iface}')
                 mon_iface = self._find_monitor_interface()
                 if mon_iface:
                     self.interface = mon_iface
@@ -588,13 +588,155 @@ class wifi_cracker:
                 initial_timestamp TEXT
             )
         ''')
+
+        # overwatch branch: consolidated network/processing profile.
+        # captures = one row per confirmed EAPOL/PMKID capture (the "network profile").
+        # processing_runs = one row per attack attempt against a capture (sub-rows in the UI).
+        # crack_results = one row per cracked password (a capture_id may have >1, e.g. multiple clients).
+        # The .cap file itself stays on disk until a crack_results row exists for it (or the
+        # user manually deletes it) -- see delete_capture_file()/mark_capture_cracked().
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS captures (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                essid TEXT NOT NULL,
+                bssid TEXT NOT NULL,
+                channel TEXT,
+                frequency TEXT,
+                power TEXT,
+                privacy TEXT,
+                handshake_type TEXT DEFAULT 'EAPOL',
+                cap_filename TEXT,
+                captured_at TEXT NOT NULL,
+                gps_lat REAL,
+                gps_lon REAL,
+                gps_alt REAL,
+                cap_deleted INTEGER DEFAULT 0
+            )
+        ''')
+
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS processing_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                capture_id INTEGER NOT NULL REFERENCES captures(id),
+                tool TEXT NOT NULL,
+                attack_profile TEXT,
+                wordlist TEXT,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                status TEXT DEFAULT 'running'
+            )
+        ''')
+
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS crack_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                processing_run_id INTEGER NOT NULL REFERENCES processing_runs(id),
+                capture_id INTEGER NOT NULL,
+                password TEXT NOT NULL,
+                cracked_at TEXT NOT NULL
+            )
+        ''')
         
         conn.commit()
         conn.close()
 
+    def register_capture(self, essid, bssid, channel, cap_filename, frequency=None,
+                          power=None, privacy=None, handshake_type='EAPOL'):
+        """
+        Register a confirmed EAPOL/PMKID capture in the captures table.
+        Pulls GPS from self.latest_gps_position if available (overwatch branch:
+        network gpsd, may be None if GPS hasn't acquired a fix). Returns the new
+        capture's row id, used by process_all() to log processing_runs against it.
+        """
+        gps_lat = gps_lon = gps_alt = None
+        if self.latest_gps_position:
+            gps_lat = self.latest_gps_position.get('latitude')
+            gps_lon = self.latest_gps_position.get('longitude')
+            gps_alt = self.latest_gps_position.get('altitude')
+
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO captures
+                (essid, bssid, channel, frequency, power, privacy, handshake_type,
+                 cap_filename, captured_at, gps_lat, gps_lon, gps_alt)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (essid, bssid, channel, frequency, power, privacy, handshake_type,
+              os.path.basename(cap_filename), time.strftime("%Y-%m-%d %H:%M:%S"),
+              gps_lat, gps_lon, gps_alt))
+        capture_id = c.lastrowid
+        conn.commit()
+        conn.close()
+        return capture_id
+
+    def start_processing_run(self, capture_id, tool, attack_profile=None, wordlist=None):
+        """Log the start of a processing attempt against a capture. Returns the run id."""
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO processing_runs (capture_id, tool, attack_profile, wordlist, started_at, status)
+            VALUES (?, ?, ?, ?, ?, 'running')
+        ''', (capture_id, tool, attack_profile, wordlist, time.strftime("%Y-%m-%d %H:%M:%S")))
+        run_id = c.lastrowid
+        conn.commit()
+        conn.close()
+        return run_id
+
+    def complete_processing_run(self, run_id, status, password=None, capture_id=None):
+        """
+        Mark a processing run complete ('cracked', 'exhausted', or 'failed').
+        If cracked, also inserts the password into crack_results and deletes
+        the .cap file (see delete_capture_file()) since nothing further is
+        extractable from it once a password is known.
+        """
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute('''
+            UPDATE processing_runs SET completed_at = ?, status = ? WHERE id = ?
+        ''', (time.strftime("%Y-%m-%d %H:%M:%S"), status, run_id))
+
+        if status == 'cracked' and password and capture_id:
+            c.execute('''
+                INSERT INTO crack_results (processing_run_id, capture_id, password, cracked_at)
+                VALUES (?, ?, ?, ?)
+            ''', (run_id, capture_id, password, time.strftime("%Y-%m-%d %H:%M:%S")))
+
+        conn.commit()
+        conn.close()
+
+        if status == 'cracked' and capture_id:
+            self.delete_capture_file(capture_id)
+
+    def delete_capture_file(self, capture_id):
+        """
+        Delete the .cap file for a capture and mark cap_deleted=1.
+        Called automatically on a successful crack, or manually from the
+        Analysis tab's Delete button for captures the user has given up on.
+        Safe to call even if the file is already gone (e.g. re-deleted).
+        """
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute("SELECT cap_filename, cap_deleted FROM captures WHERE id = ?", (capture_id,))
+        row = c.fetchone()
+        if not row:
+            conn.close()
+            return False
+        cap_filename, already_deleted = row
+        if not already_deleted and cap_filename:
+            cap_path = os.path.join("collection", cap_filename)
+            if os.path.exists(cap_path):
+                try:
+                    os.remove(cap_path)
+                except OSError as e:
+                    self.log(f"Failed to delete {cap_path}: {e}", prefix="error")
+        c.execute("UPDATE captures SET cap_deleted = 1 WHERE id = ?", (capture_id,))
+        conn.commit()
+        conn.close()
+        return True
+
     def update_database(self, essid, data):
         """
-        Inserts or updates network information in the database based on 
+        Inserts or updates network information in the database based on
         BSSID. Uses UPSERT to avoid duplicates and update existing rows.
         """
         now = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -748,13 +890,8 @@ class wifi_cracker:
             shell_mode = False
 
         if background:
-            # In verbose mode, use PIPE rather than inheriting the parent PTY (stdout=None).
-            # Inheriting the PTY causes high-frequency background tools (aireplay-ng, airodump-ng)
-            # to flood the PTY buffer, blocking the subprocess and deadlocking Flask.
-            # Their output goes to PIPE where it's simply not read (and therefore discarded),
-            # which is fine — all meaningful status comes through self.log() calls anyway.
-            stdout = subprocess.PIPE if verbose else subprocess.DEVNULL
-            stderr = subprocess.PIPE if verbose else subprocess.DEVNULL
+            stdout = None if verbose else subprocess.DEVNULL
+            stderr = None if verbose else subprocess.DEVNULL
 
             return subprocess.Popen(
                 command,
@@ -1268,6 +1405,12 @@ class wifi_cracker:
                     sys.exit(1)
                 os.rename(cap_file, os.path.join("collection", os.path.basename(cap_file)))
                 self.log("Capture moved to /collection", prefix="moved", indent=4)
+                power = self.networks.get(network, {}).get('Power')
+                privacy = self.networks.get(network, {}).get('Privacy')
+                self.register_capture(
+                    essid=network, bssid=bssid, channel=channel,
+                    cap_filename=cap_file, power=power, privacy=privacy
+                )
             else:
                 self.handshake_captured = False
                 self.log("No EAPOL handshake found. Cleaning up.", prefix="x", indent=4)
@@ -1293,88 +1436,194 @@ class wifi_cracker:
             self.log(f"Error in has_eapol: {e}", prefix="error")
             return False
 
+    def _resolve_capture_id(self, bssid, cap_filename=None):
+        """
+        Look up the captures.id for a given BSSID (and optionally exact
+        cap_filename, since a BSSID could theoretically have multiple
+        non-deleted captures). Returns None if no match -- callers should
+        treat that as "this .cap predates the captures table" and skip
+        processing_runs tracking for it gracefully rather than failing.
+        """
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        if cap_filename:
+            c.execute(
+                "SELECT id FROM captures WHERE bssid = ? AND cap_filename = ? AND cap_deleted = 0",
+                (bssid, os.path.basename(cap_filename))
+            )
+        else:
+            c.execute(
+                "SELECT id FROM captures WHERE bssid = ? AND cap_deleted = 0 ORDER BY id DESC LIMIT 1",
+                (bssid,)
+            )
+        row = c.fetchone()
+        conn.close()
+        return row[0] if row else None
+
+    def crack_aircrack(self, cap_path, bssid, word_list, capture_id=None):
+        """
+        Runs aircrack-ng on the .cap file using a wordlist. Parses output
+        for "KEY FOUND!" to detect a successful crack and extract the
+        password, logging the attempt either way.
+        """
+        run_id = None
+        if capture_id:
+            run_id = self.start_processing_run(capture_id, tool="aircrack-ng",
+                                                attack_profile="wordlist", wordlist=word_list)
+
+        self.log(f"Running {word_list} aircrack-ng on {cap_path}...", prefix="plus", indent=4)
+        result = self.coms([
+            "aircrack-ng", "-w", word_list,
+            "-b", bssid, cap_path
+        ], capture_output=True, screenshot=True)
+
+        output = (result.stdout or "") if result else ""
+        match = re.search(r"KEY FOUND!\s*\[\s*(.+?)\s*\]", output)
+
+        if match:
+            password = match.group(1)
+            self.log(f"KEY FOUND: {password}", prefix="check", indent=8)
+            if run_id:
+                self.complete_processing_run(run_id, status="cracked",
+                                              password=password, capture_id=capture_id)
+            return password
+        else:
+            self.log("Wordlist exhausted, no key found.", prefix="x", indent=8)
+            if run_id:
+                self.complete_processing_run(run_id, status="exhausted", capture_id=capture_id)
+            return None
+
+    def crack_jtr(self, cap_path, capture_id=None):
+        """
+        Converts the .cap to .john format via wpapcap2john, then runs
+        John the Ripper against it (incremental mode, matching jtr.py's
+        approach), parsing --show output for the cracked password.
+        Intermediate .john files are written to a temp dir and removed
+        after the attempt -- they're disposable, not part of the
+        consolidated record (see directory-slimming discussion).
+        """
+        in_file = os.path.splitext(os.path.basename(cap_path))[0]
+        run_id = None
+        if capture_id:
+            run_id = self.start_processing_run(capture_id, tool="john",
+                                                attack_profile="incremental")
+
+        tmp_dir = tempfile.mkdtemp(prefix="mifi_jtr_")
+        john_file = os.path.join(tmp_dir, f"{in_file}.john")
+        try:
+            self.log("Running JTR .john conversion...", prefix="plus", indent=4)
+            with open(john_file, "w") as outfile:
+                self.coms(["wpapcap2john", cap_path],
+                          redirect_output=outfile, check=True, suppress_stderr=True)
+
+            if os.path.getsize(john_file) == 0:
+                self.log("wpapcap2john produced no output (no extractable hash).", prefix="x", indent=8)
+                if run_id:
+                    self.complete_processing_run(run_id, status="failed", capture_id=capture_id)
+                return None
+
+            with open(john_file, "r") as f:
+                content = f.read()
+            jtr_format = "wpapsk-pmk" if "$WPAPSK-PMK$" in content else "wpapsk"
+
+            self.log(f"Running John the Ripper (format={jtr_format})...", prefix="plus", indent=4)
+            self.coms(["john", f"--format={jtr_format}", "--incremental", john_file],
+                      capture_output=True)
+
+            show_result = self.coms(["john", "--show", f"--format={jtr_format}", john_file],
+                                     capture_output=True)
+            show_output = (show_result.stdout or "") if show_result else ""
+            # john --show output format: bssid:password:::essid::
+            match = re.search(r":([^:]+):::", show_output)
+
+            if match:
+                password = match.group(1)
+                self.log(f"KEY FOUND: {password}", prefix="check", indent=8)
+                if run_id:
+                    self.complete_processing_run(run_id, status="cracked",
+                                                  password=password, capture_id=capture_id)
+                return password
+            else:
+                self.log("John the Ripper: no key found.", prefix="x", indent=8)
+                if run_id:
+                    self.complete_processing_run(run_id, status="exhausted", capture_id=capture_id)
+                return None
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def crack_hcx(self, cap_path, word_list, capture_id=None):
+        """
+        Converts the .cap to hashcat's .22000 format via hcxpcapngtool,
+        then runs a wordlist attack (mode 22000, attack -a 0), parsing
+        the potfile for the cracked password. Intermediate .22000/potfile
+        are written to a temp dir and removed after the attempt.
+        """
+        in_file = os.path.splitext(os.path.basename(cap_path))[0]
+        run_id = None
+        if capture_id:
+            run_id = self.start_processing_run(capture_id, tool="hashcat",
+                                                attack_profile="wordlist", wordlist=word_list)
+
+        tmp_dir = tempfile.mkdtemp(prefix="mifi_hc_")
+        hc_file = os.path.join(tmp_dir, f"{in_file}.22000")
+        pot_file = os.path.join(tmp_dir, "hashcat.potfile")
+        try:
+            self.log("Running HCX .22000 conversion...", prefix="plus", indent=4)
+            self.coms(["hcxpcapngtool", "-o", hc_file, cap_path], capture_output=True)
+
+            if not os.path.exists(hc_file) or os.path.getsize(hc_file) == 0:
+                self.log("hcxpcapngtool produced no output (no extractable hash).", prefix="x", indent=8)
+                if run_id:
+                    self.complete_processing_run(run_id, status="failed", capture_id=capture_id)
+                return None
+
+            self.log(f"Running hashcat wordlist attack ({word_list})...", prefix="plus", indent=4)
+            self.coms(["hashcat", "-m", "22000", "-a", "0", hc_file, word_list,
+                       "--potfile-path", pot_file, "--quiet"], capture_output=True)
+
+            password = None
+            if os.path.exists(pot_file):
+                with open(pot_file, "r") as f:
+                    for line in f:
+                        if ":" in line:
+                            password = line.strip().rsplit(":", 1)[-1]
+                            break
+
+            if password:
+                self.log(f"KEY FOUND: {password}", prefix="check", indent=8)
+                if run_id:
+                    self.complete_processing_run(run_id, status="cracked",
+                                                  password=password, capture_id=capture_id)
+                return password
+            else:
+                self.log("Hashcat: no key found.", prefix="x", indent=8)
+                if run_id:
+                    self.complete_processing_run(run_id, status="exhausted", capture_id=capture_id)
+                return None
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     def process_all(self, mode, word_list=None):
         """
-        Processes all captured .cap files. Depending on the selected 
-        mode (manual or auto), runs cracking and conversion tools like 
-        aircrack-ng, wpapcap2john, and hcxpcapngtool. Archives files 
-        after processing.
+        Processes captured .cap files against one or more cracking tools
+        (aircrack-ng, John the Ripper, hashcat). Each attempt is logged in
+        processing_runs; a successful crack writes to crack_results and
+        deletes the .cap (see complete_processing_run()/delete_capture_file()).
+        Uncracked captures are left in collection/ for a future attempt with
+        a different tool/wordlist, per the "keep until cracked" policy.
 
-        - Auto mode: batch processes all .cap files.
-        - Manual mode: prompts user to select and process files 
-          individually.
+        - Auto mode: batch processes all .cap files with aircrack-ng only.
+        - Manual mode: prompts user to select a file and a tool.
         """
-        def run_aircrack(cap_path, in_file, target):
-            """
-            Runs aircrack-ng on the .cap file using a wordlist to 
-            attempt password cracking. Logs output to a result file.
-            """
-            self.log(f"Running {word_list} aircrack-ng on {cap_path}...",prefix="plus",indent=4)
-            result = self.coms([
-                "aircrack-ng", "-w", word_list,
-                "-b", self.networks[target]["BSSID"], cap_path
-            ], capture_output=True, screenshot=True)
+        def run_aircrack(cap_path, in_file, target, capture_id=None):
+            bssid = self.networks.get(target, {}).get("BSSID", "")
+            self.crack_aircrack(cap_path, bssid, word_list, capture_id=capture_id)
 
-            self.log(f"Wordlist check complete.",prefix="check",indent=8)
+        def run_jtr(cap_path, in_file, capture_id=None):
+            self.crack_jtr(cap_path, capture_id=capture_id)
 
-        def run_jtr(cap_path, in_file):
-            """
-            Converts the .cap file to .john format using wpapcap2john. 
-            Splits output into EAPOL and PMKID files for John the Ripper.
-            """
-            john_dir = "john"
-            if not os.path.exists(john_dir):
-                self.log(f"ERROR: '{john_dir}' directory not found.", prefix="x", indent=4)
-                self.log("Please run './start.sh' to create required directories.", indent=8, prefix="error")
-                return False
-            input_path = f"{john_dir}/{in_file}.john"
-            self.log(f"Running JTR .john conversion...",prefix="plus",indent=4)
-            with open(input_path, "w") as outfile:
-                self.coms(["wpapcap2john", cap_path], 
-                    redirect_output=outfile, 
-                    check=True, 
-                    suppress_stderr=True
-                    )
-            with open(input_path, "r") as file:
-                lines = file.readlines()
-
-            eapol_lines = [l for l in lines if "$WPAPSK$" in l]
-            pmkid_lines = [l for l in lines if "$WPAPSK-PMK$" in l]
-
-            if eapol_lines:
-                with open(f"{john_dir}/{in_file}_eapol.john", "w") as f:
-                    f.writelines(eapol_lines)
-            if pmkid_lines:
-                with open(f"{john_dir}/{in_file}_pmkid.john", "w") as f:
-                    f.writelines(pmkid_lines)
-            
-            self.log(f"JTR .john conversion complete.",prefix="check",indent=8)
-
-        def run_hcx(cap_path, in_file):
-            """
-            Converts the .cap file into Hashcat-compatible .22000 format 
-            using hcxpcapngtool.
-            """
-            hc_dir = "hc"
-            if not os.path.exists(hc_dir):
-                self.log(f"ERROR: '{hc_dir}' directory not found.", prefix="x", indent=4)
-                self.log("Please run './start.sh' to create required directories.", indent=8, prefix="error")
-                return False
-            out_path = f"{hc_dir}/{in_file}.22000"
-            self.log(f"Running HCX .22000 conversion...",prefix="plus",indent=4)
-            self.coms(f"hcxpcapngtool -o {out_path} {cap_path}")
-            self.log(f"HCX .22000 conversion complete.",prefix="check",indent=8)
-
-        def archive(cap_path):
-            """
-            Moves processed .cap files into the archive/pcap directory 
-            for storage.
-            """
-            if not os.path.exists("archive/pcap"):
-                self.log(f"ERROR: 'archive/pcap' directory not found.", prefix="x", indent=4)
-                self.log("Please run './start.sh' to create required directories.", indent=8, prefix="error")
-                return False
-            shutil.move(cap_path, f"archive/pcap/{os.path.basename(cap_path)}")
+        def run_hcx(cap_path, in_file, capture_id=None):
+            self.crack_hcx(cap_path, word_list, capture_id=capture_id)
 
         cap_files = glob.glob("collection/*.cap")
         if not cap_files:
@@ -1401,9 +1650,10 @@ class wifi_cracker:
                     continue
 
                 self.log(f"Processing {cap_path}",prefix="moved")
-                run_jtr(cap_path, in_file)
-                run_hcx(cap_path, in_file)
-                run_aircrack(cap_path, in_file, target)             
+                capture_id = self._resolve_capture_id(info["BSSID"], cap_path)
+                run_jtr(cap_path, in_file, capture_id=capture_id)
+                run_hcx(cap_path, in_file, capture_id=capture_id)
+                run_aircrack(cap_path, in_file, target, capture_id=capture_id)
 
         elif mode == "manual":
             while True:
@@ -1447,21 +1697,23 @@ class wifi_cracker:
                 self.log("4. All of the above", indent=4, prefix="dot")
                 method = input("Enter option number: ").strip()
                 self.log(f"Processing {choice}", prefix="moved")
+                capture_id = self._resolve_capture_id(info["BSSID"], choice)
                 if method == "1":
-                    run_aircrack(choice, in_file, target)
+                    run_aircrack(choice, in_file, target, capture_id=capture_id)
                 elif method == "2":
-                    run_jtr(choice, in_file)
+                    run_jtr(choice, in_file, capture_id=capture_id)
                 elif method == "3":
-                    run_hcx(choice, in_file)
+                    run_hcx(choice, in_file, capture_id=capture_id)
                 elif method == "4":
-                    run_jtr(choice, in_file)
-                    run_hcx(choice, in_file)
-                    run_aircrack(choice, in_file, target)
+                    run_jtr(choice, in_file, capture_id=capture_id)
+                    run_hcx(choice, in_file, capture_id=capture_id)
+                    run_aircrack(choice, in_file, target, capture_id=capture_id)
                 else:
                     self.log("Invalid option.", prefix="error")
                     continue
-
-                archive(choice)
+                # No archive step -- a successful crack auto-deletes the .cap
+                # (complete_processing_run -> delete_capture_file). Otherwise
+                # it stays in collection/ for a future attempt with another tool.
         else:
             self.log("Invalid process mode.", prefix="error")
 
@@ -1506,8 +1758,8 @@ class wifi_cracker:
             gps_port = getattr(self, "gps_network_port", 2947)
         self.log("GPS", prefix="config")
         
-        # Only check physical device existence for real /dev/ paths
-        if gps_device and gps_device.startswith('/dev/'):
+        # Check for USB GPS devices first
+        if gps_device:
             if not os.path.exists(gps_device):
                 self.log(f"GPS device {gps_device} not found.", prefix="error", indent=4)
                 with self.gps_lock:
@@ -1549,10 +1801,7 @@ class wifi_cracker:
                     self.gps_status_callback('searching')
         def poll():
             if self.verbose:
-                gps_device_display = (f"{gps_host}:{gps_port}"
-                                       if gps_device and '.gps-stub' in str(gps_device)
-                                       else (gps_device or f"{gps_host}:{gps_port}"))
-                self.log(f"GPS polling thread started for device: {gps_device_display}", indent=4, prefix="dot")
+                self.log(f"GPS polling thread started for device: {gps_device}", indent=4, prefix="dot")
             gps_socket = None
             data_stream = None
             try:
@@ -3424,7 +3673,7 @@ if __name__ == "__main__":
     )
     options_group.add_argument(
         "--mode",
-        choices=["config", "collect-manual", "collect-auto", "process-manual", "process-auto", "full-manual", "full-auto", "target", "map", "dashboard", "clean"],
+        choices=["config", "collect-manual", "collect-auto", "process-manual", "process-auto", "full-manual", "full-auto", "target", "map", "dashboard", "analyze", "clean"],
         required=False,
         help="Specific tool mode for refined behavior and use-case. If omitted, starts interactive CLI server."
     )
@@ -3483,6 +3732,25 @@ if __name__ == "__main__":
         default="config/rockyou.txt",
         required=False,
         help="Specifies path to custom wordlist. (Default is 'config/rockyou.txt')"
+    )
+
+    # Analyze Mode Options (non-interactive single capture/tool run -- used by
+    # the dashboard's Analysis tab API rather than the interactive process modes)
+    analyze_group = parser.add_argument_group('Analyze Mode Options')
+    analyze_group.add_argument(
+        "-CID", "--capture-id",
+        metavar="<CAPTURE_ID>",
+        type=int,
+        required=False,
+        help="captures.id row to process (required for --mode analyze)."
+    )
+    analyze_group.add_argument(
+        "-TOOL", "--tool",
+        metavar="<TOOL>",
+        type=str,
+        choices=["aircrack", "jtr", "hashcat"],
+        required=False,
+        help="Cracking tool to run against the capture (required for --mode analyze)."
     )
 
     # Target Mode Options
@@ -3726,15 +3994,41 @@ if __name__ == "__main__":
                 suite.log(f"GPS lock attempts: {args.gps_lock_attempts}", indent=4, prefix="dot")
                 suite.log(f"GPS lock wait: {args.gps_lock_wait} seconds", indent=4, prefix="dot")
                 if args.gps_port:
-                    gps_display = (f"{suite.gps_network_host}:{suite.gps_network_port}"
-                                   if '.gps-stub' in str(args.gps_port)
-                                   else args.gps_port)
-                    suite.log(f"GPS port: {gps_display}", indent=4, prefix="dot")
+                    suite.log(f"GPS port: {args.gps_port}", indent=4, prefix="dot")
 
         print_mode_parameters()
 
         if mode_type == "config":
             suite.configure_interface()
+
+        elif mode_type == "analyze":
+            if not args.capture_id or not args.tool:
+                suite.log("--mode analyze requires --capture-id and --tool.", prefix="x")
+                sys.exit(1)
+            conn = sqlite3.connect(suite.db_file)
+            c = conn.cursor()
+            c.execute("SELECT bssid, cap_filename, cap_deleted FROM captures WHERE id = ?",
+                      (args.capture_id,))
+            row = c.fetchone()
+            conn.close()
+            if not row:
+                suite.log(f"No capture found with id {args.capture_id}.", prefix="x")
+                sys.exit(1)
+            bssid, cap_filename, cap_deleted = row
+            if cap_deleted or not cap_filename:
+                suite.log(f"Capture {args.capture_id} has no .cap on disk (already cracked/deleted).", prefix="x")
+                sys.exit(1)
+            cap_path = os.path.join("collection", cap_filename)
+            if not os.path.exists(cap_path):
+                suite.log(f"Expected capture file not found: {cap_path}", prefix="x")
+                sys.exit(1)
+
+            if args.tool == "aircrack":
+                suite.crack_aircrack(cap_path, bssid, args.word_list, capture_id=args.capture_id)
+            elif args.tool == "jtr":
+                suite.crack_jtr(cap_path, capture_id=args.capture_id)
+            elif args.tool == "hashcat":
+                suite.crack_hcx(cap_path, args.word_list, capture_id=args.capture_id)
 
         elif mode_type == "collect":
             suite.collect(
