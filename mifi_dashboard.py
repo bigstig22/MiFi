@@ -53,7 +53,9 @@ def debug_print(msg, prefix='[DEBUG]', indent=0):
 
 # Global state for control panel
 mifi_process = None
-mifi_log_queue = queue.Queue()
+# Bounded queue -- on overflow (e.g. airodump-ng flood) oldest entries are
+# dropped rather than blocking the log-reading thread and deadlocking Flask.
+mifi_log_queue = queue.Queue(maxsize=500)
 prompt_queue = queue.Queue()  # For interactive prompts
 prompt_responses = {}  # Store responses to prompts
 tak_password_queue = queue.Queue()  # For TAK certificate password
@@ -1934,9 +1936,31 @@ def read_process_logs(process, stdout_file=None):
         mifi_status['mode'] = None
         mifi_status['pid'] = None
 
+# Compiled ANSI escape sequence pattern -- strips color/cursor codes from
+# airodump-ng and other tools that do terminal screen-refresh output.
+_ANSI_RE = __import__('re').compile(r'\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+def _queue_put_nowait(entry):
+    """Non-blocking queue put -- drops the oldest entry on overflow rather than
+    blocking the log-reading thread (which would deadlock Flask worker threads)."""
+    try:
+        mifi_log_queue.put_nowait(entry)
+    except __import__('queue').Full:
+        try:
+            mifi_log_queue.get_nowait()  # drop oldest
+            mifi_log_queue.put_nowait(entry)
+        except Exception:
+            pass  # queue in flux, just drop this entry
+
 def _process_log_line(process, line, line_count, recent_prompts=None):
     """Process a single log line and detect prompts"""
     try:
+        # Strip ANSI escape codes before any processing.
+        # airodump-ng and other tools emit continuous screen-refresh sequences
+        # that corrupt JSON serialization and inflate queue volume.
+        line = _ANSI_RE.sub('', line)
+        if not line.strip():
+            return
         parsed = parse_log_line(line.strip())
         message = parsed.get('message', '').strip()
         
@@ -1944,10 +1968,9 @@ def _process_log_line(process, line, line_count, recent_prompts=None):
         message_lower = message.lower()
         
         # Pre-filter: structural patterns that are always raw iw/ip-link output
-        # e.g. '5: wlan0: <BROADCAST,ALLMULTI,PROMISC,...>' lines from ip link show
-        import re as _re
-        if _re.match(r'^\d+:\s+\w+:', message) or _re.match(r'^\s*\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+', message):
-            return  # raw ip link / TXQ stats line
+        import re as _re2
+        if _re2.match(r'^\d+:\s+\w+:', message) or _re2.match(r'^\s*\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+', message):
+            return
         
         if any(skip in message_lower for skip in [
             'checking system directory structure',
@@ -1965,6 +1988,10 @@ def _process_log_line(process, line, line_count, recent_prompts=None):
             'response submitted:',
             'exiting manual mode...',
             'mode: collect-manual complete',
+            # Filter airodump-ng screen-refresh table output
+            'bssid',
+            'station mac',
+            'not associated',
             # Filter airmon/iw/ip-link raw verbose output
             'phy#',
             'driver',
@@ -1979,7 +2006,7 @@ def _process_log_line(process, line, line_count, recent_prompts=None):
             'rts thr:',
             'fragment thr:',
             'power management:',
-            # Raw iw dev output lines
+            # Raw iw dev / ip link output lines
             'ifindex ',
             'wdev 0x',
             'qsz-byt',
@@ -1991,14 +2018,13 @@ def _process_log_line(process, line, line_count, recent_prompts=None):
             'link/ether',
             'center1:',
             'rtw_8812au',
-            # GPS internal polling debug lines
+            # GPS internal polling debug
             'gps tpv data:',
             'gps mode=0',
             'gps mode=1',
             'gps attempting lock:',
             'gps receiving valid coordinates:',
             'gps polling thread started',
-            # .gps-stub implementation detail
             '.gps-stub',
         ]):
             # Skip verbose messages but still process prompts
@@ -2049,7 +2075,7 @@ def _process_log_line(process, line, line_count, recent_prompts=None):
                 'tak_password': True
             }
             # Detected TAK password prompt in log (debug output removed)
-            mifi_log_queue.put(parsed)
+            _queue_put_nowait(parsed)
             return
         # Config mode: wireless interface prompt
         elif 'wireless interface' in line_lower and 'monitor mode' in line_lower:
@@ -2097,11 +2123,11 @@ def _process_log_line(process, line, line_count, recent_prompts=None):
             }
             if not parsed.get('message') or not parsed['message'].strip():
                 parsed['message'] = prompt_msg
-            mifi_log_queue.put(parsed)
+            _queue_put_nowait(parsed)
             _queued_already = True
             # Prompt queued for immediate delivery (debug output removed)
         if not _queued_already:
-            mifi_log_queue.put(parsed)
+            _queue_put_nowait(parsed)
     except Exception as e:
         error_msg = f'Error processing log line: {str(e)}'
         print(f"[ERROR] {error_msg}")
@@ -2109,7 +2135,7 @@ def _process_log_line(process, line, line_count, recent_prompts=None):
         traceback.print_exc()
         error_data = {'message': error_msg, 'level': 'error'}
         try:
-            mifi_log_queue.put(error_data)
+            _queue_put_nowait(error_data)
         except:
             pass
 
@@ -7846,7 +7872,7 @@ def index():
             if (mode === 'map') {
                 params.max_scans = document.getElementById('maxScans').value;
                 params.scan_duration = document.getElementById('scanDuration').value;
-                // gps_port intentionally not sent -- backend always uses .gps-stub
+                // gps_port not sent -- backend uses .gps-stub
                 params.gps_lock_attempts = document.getElementById('gpsLockAttempts').value;
                 params.gps_lock_wait = document.getElementById('gpsLockWait').value;
             }
