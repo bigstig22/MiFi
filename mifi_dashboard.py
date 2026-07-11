@@ -288,69 +288,6 @@ def check_gps_status():
                 mifi_service.gps_lock.release()
     return 'disabled'
     
-    try:
-        try:
-            # Import gps3 the same way as mifi.py does
-            from gps3 import gps3
-        except ImportError:
-            return 'no_modules'
-        
-        # Check for USB GPS devices using glob (more reliable than ls with wildcards)
-        usb_devices = []
-        try:
-            # Use glob to find USB serial devices
-            usb_devices = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
-            # Filter out empty strings
-            usb_devices = [d for d in usb_devices if d and os.path.exists(d)]
-        except Exception as e:
-            pass
-        
-        if not usb_devices:
-            # No USB GPS devices found (debug output removed)
-            return 'no_device'
-        
-        # Found USB GPS devices (debug output removed)
-        
-        result = subprocess.run(['pgrep', '-f', 'gpsd'], capture_output=True, timeout=2)
-        if result.returncode != 0:
-            # gpsd is not running (debug output removed)
-            return 'no_device'
-        
-        # gpsd is running (debug output removed)
-        
-        try:
-            # For status check, just verify gpsd is accessible
-            # The continuous polling thread will do the actual GPS data reading
-            # This is a quick non-blocking check
-            gps_socket = gps3.GPSDSocket()
-            
-            try:
-                # Try to connect to gpsd (quick check)
-                gps_socket.connect()
-                gps_socket.watch()
-                # If we can connect, GPS is at least searching
-                # The polling thread will update to 'locked' when it gets a fix
-                gps_socket.close()
-                # GPS connection successful (debug output removed)
-                return 'searching'  # Return searching - polling thread will update to locked/no_data
-            except Exception as e:
-                # GPS connection error (debug output removed)
-                try:
-                    gps_socket.close()
-                except:
-                    pass
-                return 'no_data'  # Can't connect to gpsd
-        except Exception as e:
-            # GPS check exception (debug output removed)
-            import traceback
-            traceback.print_exc()
-            return 'no_data'
-    except Exception as e:
-        # GPS check outer exception (debug output removed)
-        import traceback
-        traceback.print_exc()
-        return 'unknown'
-
 def start_gps_polling_thread():
     """Start continuous GPS polling thread - similar to mifi.py's start_gps_polling"""
     global gps_service_thread, gps_polling_stop
@@ -1326,6 +1263,11 @@ def read_process_logs(process, stdout_file=None):
         
         # Entering read_process_logs try block (debug output removed)
         buffer = ''
+        # Stateful UTF-8 incremental decoder -- buffers incomplete multi-byte
+        # sequences (e.g. box-drawing chars split across PTY reads) rather than
+        # substituting them with replacement chars. Fixes the \ufffd corruption.
+        import codecs as _codecs
+        _utf8_decoder = _codecs.getincrementaldecoder('utf-8')(errors='replace')
         consecutive_errors = 0
         max_consecutive_errors = 10  # Allow up to 10 consecutive errors before giving up
         loop_iteration = 0
@@ -1353,14 +1295,10 @@ def read_process_logs(process, stdout_file=None):
                                 # Read directly from raw file descriptor
                                 raw_chunk = os.read(fd, 1024)
                                 if raw_chunk:
-                                    # Decode with better error handling for box-drawing characters
                                     try:
-                                        chunk = raw_chunk.decode('utf-8', errors='surrogateescape')
-                                        # Replace any surrogate characters
-                                        if any(ord(c) >= 0xD800 and ord(c) <= 0xDFFF for c in chunk):
-                                            chunk = chunk.encode('utf-8', errors='surrogateescape').decode('utf-8', errors='replace')
-                                    except UnicodeDecodeError:
-                                        chunk = raw_chunk.decode('utf-8', errors='replace')
+                                        chunk = _utf8_decoder.decode(raw_chunk)
+                                    except Exception:
+                                        chunk = raw_chunk.decode('latin-1')
                                     buffer += chunk
                                     buffer_unchanged_count = 0
                                     # Process any complete lines immediately
@@ -1482,16 +1420,12 @@ def read_process_logs(process, stdout_file=None):
                                 # os.read() called (debug output removed)
                                 raw_chunk = os.read(fd, 1024)
                                 # os.read() returned (debug output removed)
-                                # Decode bytes to string - use 'surrogateescape' to preserve invalid bytes
+                                # Decode bytes using stateful UTF-8 incremental decoder
                                 # then replace surrogates to handle box-drawing characters properly
                                 try:
-                                    chunk = raw_chunk.decode('utf-8', errors='surrogateescape')
-                                    # Replace any surrogate characters that couldn't be decoded
-                                    if any(ord(c) >= 0xD800 and ord(c) <= 0xDFFF for c in chunk):
-                                        chunk = chunk.encode('utf-8', errors='surrogateescape').decode('utf-8', errors='replace')
-                                except UnicodeDecodeError:
-                                    # Fallback to replace for truly invalid sequences
-                                    chunk = raw_chunk.decode('utf-8', errors='replace')
+                                    chunk = _utf8_decoder.decode(raw_chunk)
+                                except Exception:
+                                    chunk = raw_chunk.decode('latin-1')
                                 # Decoded chunk (debug output removed)
                             finally:
                                 # Restore original flags
@@ -1613,14 +1547,10 @@ def read_process_logs(process, stdout_file=None):
                                         raw_quick_chunk = os.read(fd, 1024)
                                         if raw_quick_chunk:
                                             # Decode bytes to string
-                                            # Decode with better error handling for box-drawing characters
                                             try:
-                                                quick_chunk = raw_quick_chunk.decode('utf-8', errors='surrogateescape')
-                                                # Replace any surrogate characters
-                                                if any(ord(c) >= 0xD800 and ord(c) <= 0xDFFF for c in quick_chunk):
-                                                    quick_chunk = quick_chunk.encode('utf-8', errors='surrogateescape').decode('utf-8', errors='replace')
-                                            except UnicodeDecodeError:
-                                                quick_chunk = raw_quick_chunk.decode('utf-8', errors='replace')
+                                                quick_chunk = _utf8_decoder.decode(raw_quick_chunk)
+                                            except Exception:
+                                                quick_chunk = raw_quick_chunk.decode('latin-1')
                                             # Quick read successful
                                             buffer += quick_chunk
                                             buffer_unchanged_count = 0  # Reset counter
@@ -2620,25 +2550,53 @@ def list_bssids():
     conn.close()
     return jsonify(bssids)
 
+@app.route('/api/wordlists')
+def list_wordlists():
+    """
+    Scans config/*.txt for wordlist files (one password per line) and returns
+    them as selectable options for the Analysis tab's cracking tool UI.
+    Files are listed by basename; the tool receives the relative path
+    (e.g. 'config/rockyou.txt') so mifi.py can open them from its cwd (/MiFi).
+    """
+    config_dir = os.path.join(os.path.dirname(__file__), 'config')
+    wordlists = []
+    if os.path.isdir(config_dir):
+        for fname in sorted(os.listdir(config_dir)):
+            if fname.endswith('.txt'):
+                fpath = os.path.join(config_dir, fname)
+                try:
+                    size = os.path.getsize(fpath)
+                    size_str = (f"{size // 1024 // 1024}MB" if size > 1024*1024
+                                else f"{size // 1024}KB" if size > 1024
+                                else f"{size}B")
+                    wordlists.append({
+                        'value': f"config/{fname}",
+                        'label': f"{fname} ({size_str})"
+                    })
+                except OSError:
+                    pass
+    return jsonify(wordlists)
+
 @app.route('/api/captures')
 def list_captures():
     """
-    Returns capture inventory grouped by ESSID -- one entry per unique network,
-    each containing its captures[] array. Each capture contains its
-    processing_runs[] and crack_results[]. Drives the three-level Analysis tab
-    table: ESSID row > capture sub-row > attempt sub-sub-row.
+    Returns the consolidated capture inventory: one entry per captures row,
+    each with its nested processing_runs (sub-rows) and any crack_results.
+    This is the data source for the Analysis tab's collapsible table and map.
     """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    c.execute('SELECT * FROM captures WHERE cap_deleted = 0 ORDER BY captured_at DESC')
-    all_caps = [dict(row) for row in c.fetchall()]
+    c.execute('SELECT * FROM captures ORDER BY captured_at DESC')
+    captures = [dict(row) for row in c.fetchall()]
 
-    for cap in all_caps:
+    for cap in captures:
         c.execute('SELECT * FROM processing_runs WHERE capture_id = ? ORDER BY started_at', (cap['id'],))
         cap['processing_runs'] = [dict(r) for r in c.fetchall()]
         c.execute('SELECT * FROM crack_results WHERE capture_id = ? ORDER BY cracked_at', (cap['id'],))
         cap['crack_results'] = [dict(r) for r in c.fetchall()]
+        # Derived status for the row's color/badge -- cracked takes priority,
+        # then a still-running attempt, then exhausted/failed, else untouched.
         if cap['crack_results']:
             cap['status'] = 'cracked'
         elif any(r['status'] == 'running' for r in cap['processing_runs']):
@@ -2648,35 +2606,8 @@ def list_captures():
         else:
             cap['status'] = 'unprocessed'
 
-    # Group by ESSID
-    seen = {}
-    for cap in all_caps:
-        essid = cap['essid']
-        if essid not in seen:
-            seen[essid] = {'essid': essid, 'bssid': cap['bssid'], 'captures': [],
-                           'gps_lat': None, 'gps_lon': None}
-        seen[essid]['captures'].append(cap)
-        if cap['gps_lat'] and not seen[essid]['gps_lat']:
-            seen[essid]['gps_lat'] = cap['gps_lat']
-            seen[essid]['gps_lon'] = cap['gps_lon']
-
-    grouped = list(seen.values())
-    for g in grouped:
-        statuses = [cap['status'] for cap in g['captures']]
-        if 'cracked' in statuses:
-            g['status'] = 'cracked'
-            g['password'] = next((cr['password'] for cap in g['captures']
-                                  for cr in cap['crack_results']), None)
-        elif 'processing' in statuses:
-            g['status'] = 'processing'; g['password'] = None
-        elif 'attempted' in statuses:
-            g['status'] = 'attempted'; g['password'] = None
-        else:
-            g['status'] = 'unprocessed'; g['password'] = None
-
     conn.close()
-    return jsonify(grouped)
-
+    return jsonify(captures)
 
 @app.route('/api/captures/<int:capture_id>/process', methods=['POST'])
 def process_capture(capture_id):
@@ -4025,7 +3956,6 @@ def dashboard():
             }
             markers = [];
             dataTableRows = [];
-            essidTableGroups = {};
             markerToRowMap.clear();
             rowToMarkerMap.clear();
             const tbody = document.getElementById('data-table-body');
@@ -4880,98 +4810,53 @@ def dashboard():
             }
         }
         
-        // ESSID-grouped data table
-        // essidTableGroups maps essid -> {rows:[], marker, pointIds:[]}
-        var essidTableGroups = {};
-
         function createTableRow(point, pointId, marker) {
             const tbody = document.getElementById('data-table-body');
-            if (!tbody) return;
-
-            const essid = point.essid || '(hidden)';
-
-            if (!essidTableGroups[essid]) {
-                // Create the parent ESSID row
-                essidTableGroups[essid] = {detections: [], marker: marker};
-
-                const parentRow = document.createElement('tr');
-                parentRow.id = `essid_row_${CSS.escape(essid)}`;
-                parentRow.style.cursor = 'pointer';
-                parentRow.style.borderTop = '2px solid #444';
-                parentRow.innerHTML = `
-                    <td style="font-weight:600;">${essid}</td>
-                    <td style="font-family:monospace; font-size:0.88em; color:#ccc;">${point.bssid || ''}</td>
-                    <td>${point.signal !== null && point.signal !== undefined ? point.signal : ''}</td>
-                    <td>${point.channel || ''}</td>
-                    <td>${point.lat ? point.lat.toFixed(6) : ''}</td>
-                    <td>${point.lon ? point.lon.toFixed(6) : ''}</td>
-                    <td>${point.altitude !== null && point.altitude !== undefined ? point.altitude.toFixed(1) : ''}</td>
-                    <td style="color:#666; font-size:0.82em;">${point.timestamp || ''}</td>
-                `;
-
-                const subRowContainer = document.createElement('tr');
-                subRowContainer.id = `essid_sub_${CSS.escape(essid)}`;
-                subRowContainer.style.display = 'none';
-                const subTd = document.createElement('td');
-                subTd.colSpan = 8;
-                subTd.style.padding = '0 0 4px 16px';
-                subTd.style.background = '#1c1c1c';
-                subRowContainer.appendChild(subTd);
-
-                parentRow.addEventListener('click', function() {
-                    const sub = document.getElementById(`essid_sub_${CSS.escape(essid)}`);
-                    if (sub) sub.style.display = sub.style.display === 'none' ? 'table-row' : 'none';
-                    if (point.lat && point.lon) {
-                        const currentMap = map || window.dashboardMap;
-                        if (currentMap) currentMap.setView([point.lat, point.lon], Math.max(currentMap.getZoom(), 15), {animate: true});
-                        if (marker) marker.openPopup();
+            const row = document.createElement('tr');
+            row.id = `row_${pointId}`;
+            row.dataset.pointId = pointId;
+            
+            row.innerHTML = `
+                <td>${point.essid || ''}</td>
+                <td>${point.bssid || ''}</td>
+                <td>${point.signal !== null && point.signal !== undefined ? point.signal : ''}</td>
+                <td>${point.channel || ''}</td>
+                <td>${point.lat ? point.lat.toFixed(6) : ''}</td>
+                <td>${point.lon ? point.lon.toFixed(6) : ''}</td>
+                <td>${point.altitude !== null && point.altitude !== undefined ? point.altitude.toFixed(1) : ''}</td>
+                <td>${point.timestamp || ''}</td>
+            `;
+            
+            // Add hover events for bidirectional highlighting
+            row.addEventListener('mouseenter', function() {
+                highlightMarker(pointId);
+                row.classList.add('highlighted');
+            });
+            row.addEventListener('mouseleave', function() {
+                unhighlightMarker(pointId);
+                row.classList.remove('highlighted');
+            });
+            
+            // Click to center map on point location
+            row.addEventListener('click', function() {
+                if (point.lat && point.lon) {
+                    const currentMap = map || window.dashboardMap;
+                    if (currentMap) {
+                        currentMap.setView([point.lat, point.lon], Math.max(currentMap.getZoom(), 15), {animate: true});
+                        if (marker) {
+                            marker.openPopup();
+                        }
                     }
-                });
-                parentRow.addEventListener('mouseenter', () => { if (marker) marker.setStyle({weight:3,radius:10,fillOpacity:1}); });
-                parentRow.addEventListener('mouseleave', () => { if (marker) marker.setStyle({weight:1,radius:6,fillOpacity:0.7}); });
-
-                tbody.appendChild(parentRow);
-                tbody.appendChild(subRowContainer);
-                dataTableRows.push(parentRow);
-                if (marker) { markerToRowMap.set(marker, parentRow); rowToMarkerMap.set(parentRow, marker); }
-            }
-
-            // Add this detection to the sub-table
-            const group = essidTableGroups[essid];
-            group.detections.push(point);
-
-            const subTd = document.querySelector(`#essid_sub_${CSS.escape(essid)} td`);
-            if (subTd && group.detections.length > 1) {
-                // Rebuild sub-table with all detections
-                let subHtml = `<table style="width:100%;font-size:0.8em;color:#888;border-collapse:collapse;">
-                    <thead><tr style="border-bottom:1px solid #2a2a2a;">
-                        <th style="text-align:left;padding:2px 8px 2px 0;font-weight:400;color:#555;">Signal</th>
-                        <th style="text-align:left;padding:2px 8px 2px 0;font-weight:400;color:#555;">Lat</th>
-                        <th style="text-align:left;padding:2px 8px 2px 0;font-weight:400;color:#555;">Lon</th>
-                        <th style="text-align:left;padding:2px 0;font-weight:400;color:#555;">Time</th>
-                    </tr></thead><tbody>`;
-                group.detections.forEach(d => {
-                    subHtml += `<tr style="border-top:1px dashed #252525;">
-                        <td style="padding:2px 8px 2px 0;">${d.signal !== null && d.signal !== undefined ? d.signal : '—'}</td>
-                        <td style="padding:2px 8px 2px 0;">${d.lat ? d.lat.toFixed(6) : '—'}</td>
-                        <td style="padding:2px 8px 2px 0;">${d.lon ? d.lon.toFixed(6) : '—'}</td>
-                        <td style="padding:2px 0;font-size:0.9em;color:#666;">${d.timestamp || '—'}</td>
-                    </tr>`;
-                });
-                subHtml += '</tbody></table>';
-                subTd.innerHTML = subHtml;
-
-                // Update parent row signal to show best (min = closest to 0)
-                const parentRow = document.getElementById(`essid_row_${CSS.escape(essid)}`);
-                if (parentRow) {
-                    const signals = group.detections.map(d => d.signal).filter(s => s !== null && s !== undefined);
-                    const bestSignal = signals.length ? Math.max(...signals) : '';
-                    const cells = parentRow.querySelectorAll('td');
-                    if (cells[2]) cells[2].textContent = bestSignal + (signals.length > 1 ? ` (${signals.length})` : '');
                 }
+            });
+            
+            tbody.appendChild(row);
+            dataTableRows.push(row);
+            if (marker) {
+                markerToRowMap.set(marker, row);
+                rowToMarkerMap.set(row, marker);
             }
         }
-
         
         function highlightRow(pointId) {
             const row = document.getElementById(`row_${pointId}`);
@@ -6170,67 +6055,19 @@ def index():
         }
         .header {
             background: #2d2d2d;
-            padding: 12px 20px;
+            padding: 20px;
             border-radius: 8px;
             margin-bottom: 20px;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            gap: 16px;
         }
-        .header h1 { color: #4CAF50; margin: 0; font-size: 1.3em; white-space: nowrap; }
-        /* Header right: two columns - buttons | indicators */
-        .header-right {
-            display: flex;
-            align-items: stretch;
-            gap: 12px;
-            margin-left: auto;
-        }
-        .header-btn-col {
-            display: flex;
-            flex-direction: column;
-            gap: 4px;
-        }
-        .header-ind-col {
-            display: flex;
-            flex-direction: column;
-            gap: 4px;
-            justify-content: center;
-        }
-        /* All toggle buttons: fixed width, fixed font size, dot always on left */
-        .status-toggle-btn {
+        .header > div {
             display: flex;
             align-items: center;
-            gap: 6px;
-            width: 140px;
-            background: #1a1a1a;
-            border: 1px solid #444;
-            border-radius: 6px;
-            padding: 5px 10px;
-            color: #ccc;
-            font-size: 0.8em;
-            cursor: pointer;
-            transition: border-color 0.2s;
-            white-space: nowrap;
-            box-sizing: border-box;
+            gap: 8px;
         }
-        .status-toggle-btn:hover { border-color: #666; }
-        .status-toggle-btn .status-dot {
-            width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
-        }
-        .status-toggle-btn .btn-label { color: #aaa; }
-        .status-toggle-btn .btn-value { color: #666; font-size: 0.92em; }
-        /* Indicators in the right column */
-        .header-indicator {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            font-size: 0.8em;
-            color: #888;
-            white-space: nowrap;
-            padding: 5px 0;
-        }
-        .header-indicator .status-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+        .header h1 { color: #4CAF50; }
         .tabs {
             display: flex;
             gap: 10px;
@@ -6535,40 +6372,11 @@ def index():
     <div class="container">
         <div class="header">
             <h1>MiFi Control Panel</h1>
-            <div class="header-right">
-                <!-- Buttons column: GPS, Interface, TAK -->
-                <div class="header-btn-col">
-                    <button class="status-toggle-btn" onclick="toggleGPS()" title="Toggle GPS monitoring">
-                        <span class="status-dot red" id="gpsDot"></span>
-                        <span class="btn-label">GPS</span>
-                        <span id="gpsStatusShort" class="btn-value">Off</span>
-                    </button>
-                    <button class="status-toggle-btn" onclick="toggleInterface()" title="Toggle monitor mode">
-                        <span class="status-dot" id="interfaceDot"></span>
-                        <span class="btn-label">Interface</span>
-                        <span id="interfaceStatusShort" class="btn-value">Unknown</span>
-                    </button>
-                    <button class="status-toggle-btn" onclick="toggleTAKConnection()" title="Toggle TAK connection">
-                        <span class="status-dot" id="takDot"></span>
-                        <span class="btn-label">TAK</span>
-                        <span id="takStatusShort" class="btn-value">Off</span>
-                    </button>
-                </div>
-                <!-- Indicators column: Operation, Server, Internet -->
-                <div class="header-ind-col">
-                    <div class="header-indicator">
-                        <span class="status-dot" id="operationDot"></span>
-                        <span id="operationStatus">Idle</span>
-                    </div>
-                    <div class="header-indicator">
-                        <span id="statusDot" class="status-dot red"></span>
-                        <span id="statusText">Server</span>
-                    </div>
-                    <div class="header-indicator">
-                        <span id="internetStatusDot" class="status-dot red"></span>
-                        <span>Internet</span>
-                    </div>
-                </div>
+            <div>
+                <span id="statusText">Initializing...</span>
+                <span id="statusDot" class="status-dot red" style="margin-right: 8px; display: inline-block;"></span>
+                <span style="margin-left: 16px;">Internet</span>
+                <span id="internetStatusDot" class="status-dot red" style="margin-left: 8px; display: inline-block;" title="Internet Connectivity"></span>
             </div>
         </div>
 
@@ -6581,6 +6389,32 @@ def index():
 
         <!-- Control Tab -->
         <div id="controlTab" class="tab-content active">
+            <div class="status-panel">
+                <h2>System Status</h2>
+                <div class="status-grid">
+                    <div class="status-item clickable" onclick="toggleGPS()">
+                        <div class="status-dot red" id="gpsDot"></div>
+                        <div class="status-label">GPS:</div>
+                        <div class="status-value" id="gpsStatus">GPS Disabled</div>
+                    </div>
+                    <div class="status-item clickable" onclick="toggleInterface()">
+                        <div class="status-dot" id="interfaceDot"></div>
+                        <div class="status-label">Interface:</div>
+                        <div class="status-value" id="interfaceStatus">Unknown</div>
+                    </div>
+                    <div class="status-item clickable" onclick="toggleTAKConnection()">
+                        <div class="status-dot" id="takDot"></div>
+                        <div class="status-label">TAK:</div>
+                        <div class="status-value" id="takStatus">TAK Disabled</div>
+                    </div>
+                    <div class="status-item">
+                        <div class="status-dot" id="operationDot"></div>
+                        <div class="status-label">Operation:</div>
+                        <div class="status-value" id="operationStatus">None</div>
+                    </div>
+                </div>
+            </div>
+
             <div class="control-panel">
                 <h2>Operation Controls</h2>
                 <div class="operation-mode-grid">
@@ -6762,8 +6596,10 @@ def index():
                         </select>
                     </div>
                     <div class="form-group">
-                        <label>Wordlist Path</label>
-                        <input type="text" id="analysisWordlist" value="config/rockyou.txt">
+                        <label>Wordlist</label>
+                        <select id="analysisWordlist" style="width:100%; background:#1a1a1a; color:#ccc; border:1px solid #444; border-radius:4px; padding:8px;">
+                            <option value="config/rockyou.txt">rockyou.txt (loading...)</option>
+                        </select>
                     </div>
                 </div>
                 <div class="operation-control-buttons">
@@ -7638,6 +7474,25 @@ def index():
                     renderAnalysisMap(data);
                 })
                 .catch(e => console.error('Failed to load captures:', e));
+            loadWordlists();
+        }
+
+        function loadWordlists() {
+            fetch('/api/wordlists')
+                .then(r => r.json())
+                .then(wordlists => {
+                    const sel = document.getElementById('analysisWordlist');
+                    if (!sel || !wordlists.length) return;
+                    const current = sel.value;
+                    sel.innerHTML = wordlists.map(w =>
+                        `<option value="${w.value}"${w.value === current ? ' selected' : ''}>${w.label}</option>`
+                    ).join('');
+                    // If current selection is no longer in the list, pick first
+                    if (!wordlists.find(w => w.value === current) && wordlists.length) {
+                        sel.value = wordlists[0].value;
+                    }
+                })
+                .catch(e => console.error('Failed to load wordlists:', e));
         }
 
         function statusBadge(status) {
@@ -7651,77 +7506,77 @@ def index():
             return '<span class="status-badge ' + cls + '">' + label + '</span>';
         }
 
-        function renderCapturesTable(grouped) {
+        function renderCapturesTable(captures) {
             const tbody = document.getElementById('capturesTableBody');
-            if (!grouped.length) {
-                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:#666; padding:20px;">No captures yet. Confirmed EAPOL handshakes will appear here after collection.</td></tr>';
+            if (!captures.length) {
+                tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:#666; padding:20px;">No captures yet. Confirmed EAPOL handshakes will appear here after collection.</td></tr>';
                 return;
             }
             let html = '';
-            grouped.forEach((g, idx) => {
+            captures.forEach((cap, idx) => {
+                const password = cap.crack_results.length ? cap.crack_results[cap.crack_results.length - 1].password : '';
                 const borderTop = idx > 0 ? 'border-top:2px solid #444;' : '';
-                const caretId = 'caret-g-' + idx;
-                const subId = 'subrows-g-' + idx;
-                html += `<tr style="cursor:pointer; ${borderTop}" onclick="toggleCaptureRow('${subId}','${caretId}')">` +
-                    `<td id="${caretId}" style="width:20px; color:#888;">&#9656;</td>` +
-                    `<td style="font-weight:600;">${g.essid}</td>` +
-                    `<td style="font-family:monospace; font-size:0.88em; color:#ccc;">${g.bssid}</td>` +
-                    `<td style="text-align:center;">${g.captures.length} capture${g.captures.length !== 1 ? 's' : ''}</td>` +
-                    `<td>${statusBadge(g.status)}${g.password ? ` <code style="margin-left:6px; color:#4CAF50;">${g.password}</code>` : ''}</td>` +
-                    `<td></td></tr>`;
+                html += `<tr style="cursor:pointer; ${borderTop}" onclick="toggleCaptureRow(${cap.id})">` +
+                    `<td id="caret-${cap.id}" style="width:20px; color:#888; padding-right:4px;">&#9656;</td>` +
+                    `<td style="font-weight:600;">${cap.essid}</td>` +
+                    `<td style="font-family:monospace; font-size:0.88em; color:#ccc;">${cap.bssid}</td>` +
+                    `<td style="text-align:center; color:#aaa;">${cap.channel || '\u2014'}</td>` +
+                    `<td style="font-size:0.88em; color:#888;">${cap.captured_at}</td>` +
+                    `<td>${statusBadge(cap.status)}${password ? ` <code style="margin-left:6px; color:#4CAF50; font-size:0.9em;">${password}</code>` : ''}</td>` +
+                    `<td style="white-space:nowrap;" onclick="event.stopPropagation();">` +
+                        `<button class="btn btn-primary" style="padding:4px 10px; font-size:0.82em; margin-right:4px;" onclick="selectCaptureForProcessing(${cap.id})">Select</button>` +
+                        `<button class="btn btn-danger" style="padding:4px 10px; font-size:0.82em;" data-delete-id="${cap.id}" onclick="deleteCaptureRow(${cap.id})">Delete</button>` +
+                    `</td>` +
+                `</tr>`;
 
-                html += `<tr id="${subId}" style="display:none;"><td></td><td colspan="5" style="padding:0 0 8px 12px; background:#1c1c1c;">`;
-                g.captures.forEach((cap, cidx) => {
-                    const capCaretId = 'caret-c-' + cap.id;
-                    const capSubId = 'subrows-c-' + cap.id;
-                    html += `<div style="margin:6px 0;">` +
-                        `<div style="display:flex; align-items:center; gap:10px; cursor:pointer; padding:4px 0; border-top:${cidx > 0 ? '1px solid #2a2a2a' : 'none'};" onclick="toggleCaptureRow('${capSubId}','${capCaretId}')">` +
-                        `<span id="${capCaretId}" style="color:#666; font-size:0.8em;">&#9656;</span>` +
-                        `<span style="font-size:0.85em; color:#888; font-family:monospace;">${cap.captured_at}</span>` +
-                        `<span style="font-size:0.82em; color:#666;">ch${cap.channel || '?'}</span>` +
-                        `${statusBadge(cap.status)}` +
-                        `<span style="margin-left:auto; display:flex; gap:6px;" onclick="event.stopPropagation();">` +
-                            `<button class="btn btn-primary" style="padding:2px 8px; font-size:0.78em;" onclick="selectCaptureForProcessing(${cap.id},'${g.essid}')">Select</button>` +
-                            `<button class="btn btn-danger" style="padding:2px 8px; font-size:0.78em;" data-delete-id="${cap.id}" onclick="deleteCaptureRow(${cap.id})">Delete</button>` +
-                        `</span></div>` +
-                        `<div id="${capSubId}" style="display:none; padding:2px 0 4px 16px;">`;
+                html += `<tr id="subrows-${cap.id}" style="display:none;">` +
+                    `<td style="border-top:1px solid #333;"></td>` +
+                    `<td colspan="6" style="border-top:1px solid #333; padding:2px 0 10px 12px; background:#1c1c1c;">`;
 
-                    if (!cap.processing_runs.length) {
-                        html += `<div style="color:#555; font-size:0.8em;">No processing attempts.</div>`;
-                    } else {
-                        cap.processing_runs.forEach((run, ridx) => {
-                            const runStatus = run.status === 'cracked' ? 'cracked' : (run.status === 'running' ? 'processing' : 'attempted');
-                            html += `<div style="display:flex; gap:12px; font-size:0.8em; color:#777; padding:2px 0; ${ridx > 0 ? 'border-top:1px dashed #252525;' : ''}">` +
-                                `<span>${run.tool}</span>` +
-                                `<span style="color:#555;">${run.attack_profile || ''}</span>` +
-                                `<span style="color:#555;">${run.started_at}</span>` +
-                                `<span>${statusBadge(runStatus)}</span>` +
-                            `</div>`;
-                        });
-                    }
-                    html += `</div></div>`;
-                });
+                if (!cap.processing_runs.length) {
+                    html += `<div style="color:#555; font-size:0.82em; padding:4px 0 2px;">No processing attempts yet.</div>`;
+                } else {
+                    html += `<table style="width:100%; border-collapse:collapse; font-size:0.82em; color:#aaa;">` +
+                        `<thead><tr style="border-bottom:1px solid #2e2e2e;">` +
+                        `<th style="text-align:left; padding:3px 10px 3px 0; font-weight:400; color:#666;">Tool</th>` +
+                        `<th style="text-align:left; padding:3px 10px 3px 0; font-weight:400; color:#666;">Profile</th>` +
+                        `<th style="text-align:left; padding:3px 10px 3px 0; font-weight:400; color:#666;">Started</th>` +
+                        `<th style="text-align:left; padding:3px 10px 3px 0; font-weight:400; color:#666;">Completed</th>` +
+                        `<th style="text-align:left; padding:3px 0; font-weight:400; color:#666;">Status</th>` +
+                        `</tr></thead><tbody>`;
+                    cap.processing_runs.forEach((run, ridx) => {
+                        const runBorder = ridx > 0 ? 'border-top:1px dashed #252525;' : '';
+                        const runStatus = run.status === 'cracked' ? 'cracked' : (run.status === 'running' ? 'processing' : 'attempted');
+                        html += `<tr style="${runBorder}">` +
+                            `<td style="padding:3px 10px 3px 0;">${run.tool}</td>` +
+                            `<td style="padding:3px 10px 3px 0; color:#777;">${run.attack_profile || '\u2014'}</td>` +
+                            `<td style="padding:3px 10px 3px 0; color:#666; font-size:0.95em;">${run.started_at}</td>` +
+                            `<td style="padding:3px 10px 3px 0; color:#666; font-size:0.95em;">${run.completed_at || '\u2014'}</td>` +
+                            `<td style="padding:3px 0;">${statusBadge(runStatus)}</td>` +
+                        `</tr>`;
+                    });
+                    html += `</tbody></table>`;
+                }
                 html += `</td></tr>`;
             });
             tbody.innerHTML = html;
         }
 
-        function toggleCaptureRow(subId, caretId) {
-            const row = document.getElementById(subId);
-            const caret = document.getElementById(caretId);
+        function toggleCaptureRow(id) {
+            const row = document.getElementById('subrows-' + id);
+            const caret = document.getElementById('caret-' + id);
             if (!row) return;
             const isOpen = row.style.display !== 'none';
-            row.style.display = isOpen ? 'none' : (row.tagName === 'TR' ? 'table-row' : 'block');
-            if (caret) caret.innerHTML = isOpen ? '&#9656;' : '&#9662;';
+            row.style.display = isOpen ? 'none' : 'table-row';
+            caret.innerHTML = isOpen ? '&#9656;' : '&#9662;';
         }
 
-
-        function selectCaptureForProcessing(capId, essid) {
-            analysisSelectedCaptureId = capId;
-            document.getElementById('analysisSelectedCapture').value = essid + ' (capture #' + capId + ')';
+        function selectCaptureForProcessing(id) {
+            analysisSelectedCaptureId = id;
+            const cap = analysisCapturesCache.find(c => c.id === id);
+            document.getElementById('analysisSelectedCapture').value = cap ? (cap.essid + ' (' + cap.bssid + ')') : ('Capture #' + id);
             document.getElementById('analysisExecuteBtn').disabled = false;
         }
-
 
         function executeAnalysisProcess() {
             if (!analysisSelectedCaptureId) return;
@@ -7788,28 +7643,32 @@ def index():
             }
         }
 
-        function renderAnalysisMap(grouped) {
+        function renderAnalysisMap(captures) {
             const el = document.getElementById('analysisMap');
             if (!el) return;
             if (!analysisMapInstance) {
                 analysisMapInstance = L.map('analysisMap', {maxZoom: 18}).setView([0, 0], 2);
                 L.tileLayer('http://10.0.1.3:8080/data/globe/{z}/{x}/{y}.png', {maxZoom: 18}).addTo(analysisMapInstance);
             }
+            // Clear existing markers
             analysisMapInstance.eachLayer(layer => {
                 if (layer instanceof L.CircleMarker) analysisMapInstance.removeLayer(layer);
             });
-            const pts = grouped.filter(g => g.gps_lat && g.gps_lon);
-            if (!pts.length) return;
-            pts.forEach(g => {
-                const color = g.status === 'cracked' ? '#4CAF50' : (g.status === 'processing' ? '#ffb300' : '#f44336');
-                L.circleMarker([g.gps_lat, g.gps_lon], {
-                    radius: 8, color, fillColor: color, fillOpacity: 0.8, weight: 2
-                }).addTo(analysisMapInstance)
-                  .bindPopup(`<b>${g.essid}</b><br>${g.bssid}<br>${g.captures.length} capture(s)`);
-            });
-            analysisMapInstance.fitBounds(L.latLngBounds(pts.map(g => [g.gps_lat, g.gps_lon])), {padding: [30, 30]});
-        }
 
+            const pts = captures.filter(c => c.gps_lat && c.gps_lon);
+            if (!pts.length) return;
+
+            pts.forEach(cap => {
+                const color = cap.status === 'cracked' ? '#4CAF50' : (cap.status === 'processing' ? '#ffb300' : '#f44336');
+                const marker = L.circleMarker([cap.gps_lat, cap.gps_lon], {
+                    radius: 8, color: color, fillColor: color, fillOpacity: 0.8, weight: 2
+                }).addTo(analysisMapInstance);
+                marker.bindPopup('<b>' + cap.essid + '</b><br>' + cap.bssid + '<br>' + statusBadge(cap.status));
+            });
+
+            const bounds = L.latLngBounds(pts.map(c => [c.gps_lat, c.gps_lon]));
+            analysisMapInstance.fitBounds(bounds, {padding: [30, 30]});
+        }
 
         function loadConfig() {
             fetch('/api/config')
@@ -8040,13 +7899,19 @@ def index():
             };
             
             const dotId = type + 'Dot';
+            const valueId = type + 'Status';
             const dot = document.getElementById(dotId);
-            // Legacy full-text element (may not exist now that status is in header)
-            const value = document.getElementById(type + 'Status');
-            // Header short-label element
-            const shortEl = document.getElementById(type + 'StatusShort');
+            const value = document.getElementById(valueId);
             
-            if (!dot) return;  // dot is required; value/shortEl are optional
+            if (!dot || !value) {
+                // Only log as warning for operation status since it's optional
+                if (type !== 'operation') {
+                    console.error(`[ERROR] Status elements not found for type: ${type}`);
+                    if (!dot) console.error(`[ERROR] Element ${dotId} not found`);
+                    if (!value) console.error(`[ERROR] Element ${valueId} not found`);
+                }
+                return;
+            }
             
             // Determine color based on status
             let color = 'red'; // Default to red for unknown/error states
@@ -8080,31 +7945,24 @@ def index():
                 }
             }
             
-            // Get display text -- short version for header badge, full for legacy panel
+            // Get display text
             const displayText = statusMap[type]?.[status] || status;
-            const shortText = {
-                'gps': {'disabled':'Off','no_modules':'Off','no_device':'Off',
-                        'no_data':'No Data','searching':'Searching','locked':'Locked','unknown':'?'},
-                'interface': {'monitor_mode':'Monitor','managed_mode':'Managed',
-                              'no_interface':'None','unknown':'?'},
-                'tak': {'connected':'Connected','enabled':'Enabled','disabled':'Off','unknown':'?'},
-                'operation': {}
-            }[type]?.[status] || status;
-
+            
             // Update DOM
             dot.className = 'status-dot ' + color;
-            if (value) { value.textContent = displayText; void value.offsetHeight; }
-            if (shortEl) shortEl.textContent = shortText;
-
-            // Force reflow
+            value.textContent = displayText;
+            
+            // Force a reflow to ensure changes are visible
             void dot.offsetHeight;
+            void value.offsetHeight;
         }
 
         function toggleGPS() {
             const gpsDot = document.getElementById('gpsDot');
-            const gpsShort = document.getElementById('gpsStatusShort');
-            const currentStatus = gpsShort ? gpsShort.textContent.trim() : 'unknown';
-            const isCurrentlyEnabled = !['Off', 'unknown'].includes(currentStatus);
+            const gpsStatus = document.getElementById('gpsStatus');
+            
+            const currentStatus = gpsStatus ? gpsStatus.textContent.trim() : 'unknown';
+            const isCurrentlyEnabled = currentStatus.includes('Locked') || currentStatus.includes('Searching') || currentStatus.includes('No USB Device') || currentStatus.includes('No GPS Data');
             
             addLog('Toggling GPS monitoring...', 'info');
             
@@ -8206,7 +8064,8 @@ def index():
         }
 
         function toggleInterface() {
-            const statusEl = document.getElementById('interfaceStatusShort');
+            
+            const statusEl = document.getElementById('interfaceStatus');
             const currentStatus = statusEl ? statusEl.textContent.trim() : '';
             
             fetch('/api/interface/toggle', {
@@ -8239,10 +8098,10 @@ def index():
         
         function toggleTAKConnection() {
             const takDot = document.getElementById('takDot');
-            const takStatus = document.getElementById('takStatusShort');
+            const takStatus = document.getElementById('takStatus');
             
             const currentStatus = takStatus ? takStatus.textContent.trim() : 'unknown';
-            const isCurrentlyConnected = currentStatus === 'Connected';
+            const isCurrentlyConnected = currentStatus.includes('Connected');
             
             // Prevent multiple simultaneous requests
             if (takDot && takDot.style.pointerEvents === 'none') {
