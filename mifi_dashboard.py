@@ -288,6 +288,69 @@ def check_gps_status():
                 mifi_service.gps_lock.release()
     return 'disabled'
     
+    try:
+        try:
+            # Import gps3 the same way as mifi.py does
+            from gps3 import gps3
+        except ImportError:
+            return 'no_modules'
+        
+        # Check for USB GPS devices using glob (more reliable than ls with wildcards)
+        usb_devices = []
+        try:
+            # Use glob to find USB serial devices
+            usb_devices = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
+            # Filter out empty strings
+            usb_devices = [d for d in usb_devices if d and os.path.exists(d)]
+        except Exception as e:
+            pass
+        
+        if not usb_devices:
+            # No USB GPS devices found (debug output removed)
+            return 'no_device'
+        
+        # Found USB GPS devices (debug output removed)
+        
+        result = subprocess.run(['pgrep', '-f', 'gpsd'], capture_output=True, timeout=2)
+        if result.returncode != 0:
+            # gpsd is not running (debug output removed)
+            return 'no_device'
+        
+        # gpsd is running (debug output removed)
+        
+        try:
+            # For status check, just verify gpsd is accessible
+            # The continuous polling thread will do the actual GPS data reading
+            # This is a quick non-blocking check
+            gps_socket = gps3.GPSDSocket()
+            
+            try:
+                # Try to connect to gpsd (quick check)
+                gps_socket.connect()
+                gps_socket.watch()
+                # If we can connect, GPS is at least searching
+                # The polling thread will update to 'locked' when it gets a fix
+                gps_socket.close()
+                # GPS connection successful (debug output removed)
+                return 'searching'  # Return searching - polling thread will update to locked/no_data
+            except Exception as e:
+                # GPS connection error (debug output removed)
+                try:
+                    gps_socket.close()
+                except:
+                    pass
+                return 'no_data'  # Can't connect to gpsd
+        except Exception as e:
+            # GPS check exception (debug output removed)
+            import traceback
+            traceback.print_exc()
+            return 'no_data'
+    except Exception as e:
+        # GPS check outer exception (debug output removed)
+        import traceback
+        traceback.print_exc()
+        return 'unknown'
+
 def start_gps_polling_thread():
     """Start continuous GPS polling thread - similar to mifi.py's start_gps_polling"""
     global gps_service_thread, gps_polling_stop
@@ -1263,11 +1326,6 @@ def read_process_logs(process, stdout_file=None):
         
         # Entering read_process_logs try block (debug output removed)
         buffer = ''
-        # Stateful UTF-8 incremental decoder -- buffers incomplete multi-byte
-        # sequences (e.g. box-drawing chars split across PTY reads) rather than
-        # substituting them with replacement chars. Fixes the \ufffd corruption.
-        import codecs as _codecs
-        _utf8_decoder = _codecs.getincrementaldecoder('utf-8')(errors='replace')
         consecutive_errors = 0
         max_consecutive_errors = 10  # Allow up to 10 consecutive errors before giving up
         loop_iteration = 0
@@ -1295,10 +1353,14 @@ def read_process_logs(process, stdout_file=None):
                                 # Read directly from raw file descriptor
                                 raw_chunk = os.read(fd, 1024)
                                 if raw_chunk:
+                                    # Decode with better error handling for box-drawing characters
                                     try:
-                                        chunk = _utf8_decoder.decode(raw_chunk)
-                                    except Exception:
-                                        chunk = raw_chunk.decode('latin-1')
+                                        chunk = raw_chunk.decode('utf-8', errors='surrogateescape')
+                                        # Replace any surrogate characters
+                                        if any(ord(c) >= 0xD800 and ord(c) <= 0xDFFF for c in chunk):
+                                            chunk = chunk.encode('utf-8', errors='surrogateescape').decode('utf-8', errors='replace')
+                                    except UnicodeDecodeError:
+                                        chunk = raw_chunk.decode('utf-8', errors='replace')
                                     buffer += chunk
                                     buffer_unchanged_count = 0
                                     # Process any complete lines immediately
@@ -1420,12 +1482,16 @@ def read_process_logs(process, stdout_file=None):
                                 # os.read() called (debug output removed)
                                 raw_chunk = os.read(fd, 1024)
                                 # os.read() returned (debug output removed)
-                                # Decode bytes using stateful UTF-8 incremental decoder
+                                # Decode bytes to string - use 'surrogateescape' to preserve invalid bytes
                                 # then replace surrogates to handle box-drawing characters properly
                                 try:
-                                    chunk = _utf8_decoder.decode(raw_chunk)
-                                except Exception:
-                                    chunk = raw_chunk.decode('latin-1')
+                                    chunk = raw_chunk.decode('utf-8', errors='surrogateescape')
+                                    # Replace any surrogate characters that couldn't be decoded
+                                    if any(ord(c) >= 0xD800 and ord(c) <= 0xDFFF for c in chunk):
+                                        chunk = chunk.encode('utf-8', errors='surrogateescape').decode('utf-8', errors='replace')
+                                except UnicodeDecodeError:
+                                    # Fallback to replace for truly invalid sequences
+                                    chunk = raw_chunk.decode('utf-8', errors='replace')
                                 # Decoded chunk (debug output removed)
                             finally:
                                 # Restore original flags
@@ -1547,10 +1613,14 @@ def read_process_logs(process, stdout_file=None):
                                         raw_quick_chunk = os.read(fd, 1024)
                                         if raw_quick_chunk:
                                             # Decode bytes to string
+                                            # Decode with better error handling for box-drawing characters
                                             try:
-                                                quick_chunk = _utf8_decoder.decode(raw_quick_chunk)
-                                            except Exception:
-                                                quick_chunk = raw_quick_chunk.decode('latin-1')
+                                                quick_chunk = raw_quick_chunk.decode('utf-8', errors='surrogateescape')
+                                                # Replace any surrogate characters
+                                                if any(ord(c) >= 0xD800 and ord(c) <= 0xDFFF for c in quick_chunk):
+                                                    quick_chunk = quick_chunk.encode('utf-8', errors='surrogateescape').decode('utf-8', errors='replace')
+                                            except UnicodeDecodeError:
+                                                quick_chunk = raw_quick_chunk.decode('utf-8', errors='replace')
                                             # Quick read successful
                                             buffer += quick_chunk
                                             buffer_unchanged_count = 0  # Reset counter
@@ -2549,33 +2619,6 @@ def list_bssids():
     bssids = [row[0] for row in c.fetchall() if row[0]]
     conn.close()
     return jsonify(bssids)
-
-@app.route('/api/wordlists')
-def list_wordlists():
-    """
-    Scans config/*.txt for wordlist files (one password per line) and returns
-    them as selectable options for the Analysis tab's cracking tool UI.
-    Files are listed by basename; the tool receives the relative path
-    (e.g. 'config/rockyou.txt') so mifi.py can open them from its cwd (/MiFi).
-    """
-    config_dir = os.path.join(os.path.dirname(__file__), 'config')
-    wordlists = []
-    if os.path.isdir(config_dir):
-        for fname in sorted(os.listdir(config_dir)):
-            if fname.endswith('.txt'):
-                fpath = os.path.join(config_dir, fname)
-                try:
-                    size = os.path.getsize(fpath)
-                    size_str = (f"{size // 1024 // 1024}MB" if size > 1024*1024
-                                else f"{size // 1024}KB" if size > 1024
-                                else f"{size}B")
-                    wordlists.append({
-                        'value': f"config/{fname}",
-                        'label': f"{fname} ({size_str})"
-                    })
-                except OSError:
-                    pass
-    return jsonify(wordlists)
 
 @app.route('/api/captures')
 def list_captures():
@@ -6561,16 +6604,16 @@ def index():
             <div class="control-panel">
                 <h2>Capture Inventory</h2>
                 <div style="overflow-x:auto;">
-                    <table class="data-table" id="capturesTable" style="width:100%;">
+                    <table class="data-table" id="capturesTable" style="width:100%; table-layout:fixed;">
                         <thead>
                             <tr>
                                 <th style="width:24px;"></th>
-                                <th>ESSID</th>
-                                <th>BSSID</th>
-                                <th>Channel</th>
-                                <th>Captured</th>
-                                <th>Status</th>
-                                <th>Actions</th>
+                                <th style="width:22%;">ESSID</th>
+                                <th style="width:18%;">BSSID</th>
+                                <th style="width:8%;">Channel</th>
+                                <th style="width:20%;">Captured</th>
+                                <th style="width:14%;">Status</th>
+                                <th style="width:18%;">Actions</th>
                             </tr>
                         </thead>
                         <tbody id="capturesTableBody">
@@ -6596,10 +6639,8 @@ def index():
                         </select>
                     </div>
                     <div class="form-group">
-                        <label>Wordlist</label>
-                        <select id="analysisWordlist" style="width:100%; background:#1a1a1a; color:#ccc; border:1px solid #444; border-radius:4px; padding:8px;">
-                            <option value="config/rockyou.txt">rockyou.txt (loading...)</option>
-                        </select>
+                        <label>Wordlist Path</label>
+                        <input type="text" id="analysisWordlist" value="config/rockyou.txt">
                     </div>
                 </div>
                 <div class="operation-control-buttons">
@@ -7474,25 +7515,6 @@ def index():
                     renderAnalysisMap(data);
                 })
                 .catch(e => console.error('Failed to load captures:', e));
-            loadWordlists();
-        }
-
-        function loadWordlists() {
-            fetch('/api/wordlists')
-                .then(r => r.json())
-                .then(wordlists => {
-                    const sel = document.getElementById('analysisWordlist');
-                    if (!sel || !wordlists.length) return;
-                    const current = sel.value;
-                    sel.innerHTML = wordlists.map(w =>
-                        `<option value="${w.value}"${w.value === current ? ' selected' : ''}>${w.label}</option>`
-                    ).join('');
-                    // If current selection is no longer in the list, pick first
-                    if (!wordlists.find(w => w.value === current) && wordlists.length) {
-                        sel.value = wordlists[0].value;
-                    }
-                })
-                .catch(e => console.error('Failed to load wordlists:', e));
         }
 
         function statusBadge(status) {
@@ -7518,8 +7540,8 @@ def index():
                 const borderTop = idx > 0 ? 'border-top:2px solid #444;' : '';
                 html += `<tr style="cursor:pointer; ${borderTop}" onclick="toggleCaptureRow(${cap.id})">` +
                     `<td id="caret-${cap.id}" style="width:20px; color:#888; padding-right:4px;">&#9656;</td>` +
-                    `<td style="font-weight:600;">${cap.essid}</td>` +
-                    `<td style="font-family:monospace; font-size:0.88em; color:#ccc;">${cap.bssid}</td>` +
+                    `<td style="font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:0;" title="${cap.essid}">${cap.essid}</td>` +
+                    `<td style="font-family:monospace; font-size:0.88em; color:#ccc; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:0;" title="${cap.bssid}">${cap.bssid}</td>` +
                     `<td style="text-align:center; color:#aaa;">${cap.channel || '\u2014'}</td>` +
                     `<td style="font-size:0.88em; color:#888;">${cap.captured_at}</td>` +
                     `<td>${statusBadge(cap.status)}${password ? ` <code style="margin-left:6px; color:#4CAF50; font-size:0.9em;">${password}</code>` : ''}</td>` +
