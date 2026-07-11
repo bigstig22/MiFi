@@ -1205,6 +1205,11 @@ class wifi_cracker:
                     continue
                 if target in self.networks:
                     self.capture_handshake(target, target_scan=target_scan, packets=packets)
+                    self.log("Rescanning in 2 seconds...", prefix="dot", indent=4)
+                    time.sleep(2)
+                    if not self.scan_networks(timeout=initial_scan):
+                        self.log("Rescan failed.", prefix="error")
+                        return False
                     break  # Break inner loop to redisplay networks after capture
                 else:
                     self.log("Invalid ESSID selected. Please try again.", prefix="error")

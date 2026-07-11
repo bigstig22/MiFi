@@ -1353,14 +1353,10 @@ def read_process_logs(process, stdout_file=None):
                                 # Read directly from raw file descriptor
                                 raw_chunk = os.read(fd, 1024)
                                 if raw_chunk:
-                                    # Decode with better error handling for box-drawing characters
                                     try:
-                                        chunk = raw_chunk.decode('utf-8', errors='surrogateescape')
-                                        # Replace any surrogate characters
-                                        if any(ord(c) >= 0xD800 and ord(c) <= 0xDFFF for c in chunk):
-                                            chunk = chunk.encode('utf-8', errors='surrogateescape').decode('utf-8', errors='replace')
-                                    except UnicodeDecodeError:
                                         chunk = raw_chunk.decode('utf-8', errors='replace')
+                                    except UnicodeDecodeError:
+                                        chunk = raw_chunk.decode('latin-1')
                                     buffer += chunk
                                     buffer_unchanged_count = 0
                                     # Process any complete lines immediately
@@ -1482,17 +1478,11 @@ def read_process_logs(process, stdout_file=None):
                                 # os.read() called (debug output removed)
                                 raw_chunk = os.read(fd, 1024)
                                 # os.read() returned (debug output removed)
-                                # Decode bytes to string - use 'surrogateescape' to preserve invalid bytes
-                                # then replace surrogates to handle box-drawing characters properly
+                                # Decode with utf-8/replace - handles box-drawing characters correctly
                                 try:
-                                    chunk = raw_chunk.decode('utf-8', errors='surrogateescape')
-                                    # Replace any surrogate characters that couldn't be decoded
-                                    if any(ord(c) >= 0xD800 and ord(c) <= 0xDFFF for c in chunk):
-                                        chunk = chunk.encode('utf-8', errors='surrogateescape').decode('utf-8', errors='replace')
-                                except UnicodeDecodeError:
-                                    # Fallback to replace for truly invalid sequences
                                     chunk = raw_chunk.decode('utf-8', errors='replace')
-                                # Decoded chunk (debug output removed)
+                                except UnicodeDecodeError:
+                                    chunk = raw_chunk.decode('latin-1')
                             finally:
                                 # Restore original flags
                                 fcntl.fcntl(fd, fcntl.F_SETFL, flags)
@@ -1613,14 +1603,10 @@ def read_process_logs(process, stdout_file=None):
                                         raw_quick_chunk = os.read(fd, 1024)
                                         if raw_quick_chunk:
                                             # Decode bytes to string
-                                            # Decode with better error handling for box-drawing characters
                                             try:
-                                                quick_chunk = raw_quick_chunk.decode('utf-8', errors='surrogateescape')
-                                                # Replace any surrogate characters
-                                                if any(ord(c) >= 0xD800 and ord(c) <= 0xDFFF for c in quick_chunk):
-                                                    quick_chunk = quick_chunk.encode('utf-8', errors='surrogateescape').decode('utf-8', errors='replace')
-                                            except UnicodeDecodeError:
                                                 quick_chunk = raw_quick_chunk.decode('utf-8', errors='replace')
+                                            except UnicodeDecodeError:
+                                                quick_chunk = raw_quick_chunk.decode('latin-1')
                                             # Quick read successful
                                             buffer += quick_chunk
                                             buffer_unchanged_count = 0  # Reset counter
@@ -2630,7 +2616,7 @@ def list_captures():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    c.execute('SELECT * FROM captures ORDER BY captured_at DESC')
+    c.execute('SELECT * FROM captures WHERE cap_deleted = 0 ORDER BY captured_at DESC')
     captures = [dict(row) for row in c.fetchall()]
 
     for cap in captures:
@@ -6219,7 +6205,7 @@ def index():
         }
         .operation-mode-grid {
             display: grid;
-            grid-template-columns: repeat(5, 1fr);
+            grid-template-columns: repeat(3, 1fr);
             grid-template-rows: auto auto;
             gap: 10px;
             margin-bottom: 20px;
@@ -6251,24 +6237,16 @@ def index():
             grid-column: 1;
             grid-row: 1;
         }
-        #modeProcess {
-            grid-column: 2;
-            grid-row: 1;
-        }
-        #modeFull {
-            grid-column: 3;
-            grid-row: 1;
-        }
         #modeTarget {
-            grid-column: 4;
+            grid-column: 2;
             grid-row: 1 / 3;
         }
         #modeMap {
-            grid-column: 5;
+            grid-column: 3;
             grid-row: 1 / 3;
         }
         #modeAuto {
-            grid-column: 1 / 4;
+            grid-column: 1;
             grid-row: 2;
         }
         .operation-mode-spacer {
@@ -6424,14 +6402,14 @@ def index():
         </div>
 
         <div class="tabs">
-            <button class="tab active" onclick="switchTab('control', event)">Control</button>
+            <button class="tab active" onclick="switchTab('collect', event)">Collect</button>
             <button class="tab" onclick="switchTab('map', event)">Map</button>
             <button class="tab" onclick="switchTab('analysis', event)">Analysis</button>
             <button class="tab" onclick="switchTab('config', event)">Config</button>
         </div>
 
         <!-- Control Tab -->
-        <div id="controlTab" class="tab-content active">
+        <div id="collectTab" class="tab-content active">
             <div class="status-panel">
                 <h2>System Status</h2>
                 <div class="status-grid">
@@ -6746,6 +6724,8 @@ def index():
                         console.error('[ERROR] loadDashboard is not a function! Type:', typeof loadDashboard);
                     }
                 }, 100);
+            } else if (tabName === 'collect') {
+                // Control tab - no special init needed
             } else if (tabName === 'analysis') {
                 loadCaptures();
             }
