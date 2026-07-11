@@ -4025,6 +4025,7 @@ def dashboard():
             }
             markers = [];
             dataTableRows = [];
+            essidTableGroups = {};
             markerToRowMap.clear();
             rowToMarkerMap.clear();
             const tbody = document.getElementById('data-table-body');
@@ -4879,53 +4880,98 @@ def dashboard():
             }
         }
         
+        // ESSID-grouped data table
+        // essidTableGroups maps essid -> {rows:[], marker, pointIds:[]}
+        var essidTableGroups = {};
+
         function createTableRow(point, pointId, marker) {
             const tbody = document.getElementById('data-table-body');
-            const row = document.createElement('tr');
-            row.id = `row_${pointId}`;
-            row.dataset.pointId = pointId;
-            
-            row.innerHTML = `
-                <td>${point.essid || ''}</td>
-                <td>${point.bssid || ''}</td>
-                <td>${point.signal !== null && point.signal !== undefined ? point.signal : ''}</td>
-                <td>${point.channel || ''}</td>
-                <td>${point.lat ? point.lat.toFixed(6) : ''}</td>
-                <td>${point.lon ? point.lon.toFixed(6) : ''}</td>
-                <td>${point.altitude !== null && point.altitude !== undefined ? point.altitude.toFixed(1) : ''}</td>
-                <td>${point.timestamp || ''}</td>
-            `;
-            
-            // Add hover events for bidirectional highlighting
-            row.addEventListener('mouseenter', function() {
-                highlightMarker(pointId);
-                row.classList.add('highlighted');
-            });
-            row.addEventListener('mouseleave', function() {
-                unhighlightMarker(pointId);
-                row.classList.remove('highlighted');
-            });
-            
-            // Click to center map on point location
-            row.addEventListener('click', function() {
-                if (point.lat && point.lon) {
-                    const currentMap = map || window.dashboardMap;
-                    if (currentMap) {
-                        currentMap.setView([point.lat, point.lon], Math.max(currentMap.getZoom(), 15), {animate: true});
-                        if (marker) {
-                            marker.openPopup();
-                        }
+            if (!tbody) return;
+
+            const essid = point.essid || '(hidden)';
+
+            if (!essidTableGroups[essid]) {
+                // Create the parent ESSID row
+                essidTableGroups[essid] = {detections: [], marker: marker};
+
+                const parentRow = document.createElement('tr');
+                parentRow.id = `essid_row_${CSS.escape(essid)}`;
+                parentRow.style.cursor = 'pointer';
+                parentRow.style.borderTop = '2px solid #444';
+                parentRow.innerHTML = `
+                    <td style="font-weight:600;">${essid}</td>
+                    <td style="font-family:monospace; font-size:0.88em; color:#ccc;">${point.bssid || ''}</td>
+                    <td>${point.signal !== null && point.signal !== undefined ? point.signal : ''}</td>
+                    <td>${point.channel || ''}</td>
+                    <td>${point.lat ? point.lat.toFixed(6) : ''}</td>
+                    <td>${point.lon ? point.lon.toFixed(6) : ''}</td>
+                    <td>${point.altitude !== null && point.altitude !== undefined ? point.altitude.toFixed(1) : ''}</td>
+                    <td style="color:#666; font-size:0.82em;">${point.timestamp || ''}</td>
+                `;
+
+                const subRowContainer = document.createElement('tr');
+                subRowContainer.id = `essid_sub_${CSS.escape(essid)}`;
+                subRowContainer.style.display = 'none';
+                const subTd = document.createElement('td');
+                subTd.colSpan = 8;
+                subTd.style.padding = '0 0 4px 16px';
+                subTd.style.background = '#1c1c1c';
+                subRowContainer.appendChild(subTd);
+
+                parentRow.addEventListener('click', function() {
+                    const sub = document.getElementById(`essid_sub_${CSS.escape(essid)}`);
+                    if (sub) sub.style.display = sub.style.display === 'none' ? 'table-row' : 'none';
+                    if (point.lat && point.lon) {
+                        const currentMap = map || window.dashboardMap;
+                        if (currentMap) currentMap.setView([point.lat, point.lon], Math.max(currentMap.getZoom(), 15), {animate: true});
+                        if (marker) marker.openPopup();
                     }
+                });
+                parentRow.addEventListener('mouseenter', () => { if (marker) marker.setStyle({weight:3,radius:10,fillOpacity:1}); });
+                parentRow.addEventListener('mouseleave', () => { if (marker) marker.setStyle({weight:1,radius:6,fillOpacity:0.7}); });
+
+                tbody.appendChild(parentRow);
+                tbody.appendChild(subRowContainer);
+                dataTableRows.push(parentRow);
+                if (marker) { markerToRowMap.set(marker, parentRow); rowToMarkerMap.set(parentRow, marker); }
+            }
+
+            // Add this detection to the sub-table
+            const group = essidTableGroups[essid];
+            group.detections.push(point);
+
+            const subTd = document.querySelector(`#essid_sub_${CSS.escape(essid)} td`);
+            if (subTd && group.detections.length > 1) {
+                // Rebuild sub-table with all detections
+                let subHtml = `<table style="width:100%;font-size:0.8em;color:#888;border-collapse:collapse;">
+                    <thead><tr style="border-bottom:1px solid #2a2a2a;">
+                        <th style="text-align:left;padding:2px 8px 2px 0;font-weight:400;color:#555;">Signal</th>
+                        <th style="text-align:left;padding:2px 8px 2px 0;font-weight:400;color:#555;">Lat</th>
+                        <th style="text-align:left;padding:2px 8px 2px 0;font-weight:400;color:#555;">Lon</th>
+                        <th style="text-align:left;padding:2px 0;font-weight:400;color:#555;">Time</th>
+                    </tr></thead><tbody>`;
+                group.detections.forEach(d => {
+                    subHtml += `<tr style="border-top:1px dashed #252525;">
+                        <td style="padding:2px 8px 2px 0;">${d.signal !== null && d.signal !== undefined ? d.signal : '—'}</td>
+                        <td style="padding:2px 8px 2px 0;">${d.lat ? d.lat.toFixed(6) : '—'}</td>
+                        <td style="padding:2px 8px 2px 0;">${d.lon ? d.lon.toFixed(6) : '—'}</td>
+                        <td style="padding:2px 0;font-size:0.9em;color:#666;">${d.timestamp || '—'}</td>
+                    </tr>`;
+                });
+                subHtml += '</tbody></table>';
+                subTd.innerHTML = subHtml;
+
+                // Update parent row signal to show best (min = closest to 0)
+                const parentRow = document.getElementById(`essid_row_${CSS.escape(essid)}`);
+                if (parentRow) {
+                    const signals = group.detections.map(d => d.signal).filter(s => s !== null && s !== undefined);
+                    const bestSignal = signals.length ? Math.max(...signals) : '';
+                    const cells = parentRow.querySelectorAll('td');
+                    if (cells[2]) cells[2].textContent = bestSignal + (signals.length > 1 ? ` (${signals.length})` : '');
                 }
-            });
-            
-            tbody.appendChild(row);
-            dataTableRows.push(row);
-            if (marker) {
-                markerToRowMap.set(marker, row);
-                rowToMarkerMap.set(row, marker);
             }
         }
+
         
         function highlightRow(pointId) {
             const row = document.getElementById(`row_${pointId}`);
@@ -6133,46 +6179,58 @@ def index():
             gap: 16px;
         }
         .header h1 { color: #4CAF50; margin: 0; font-size: 1.3em; white-space: nowrap; }
-        .header-status {
+        /* Header right: two columns - buttons | indicators */
+        .header-right {
             display: flex;
-            align-items: center;
-            gap: 10px;
-            flex-wrap: wrap;
+            align-items: stretch;
+            gap: 12px;
+            margin-left: auto;
         }
+        .header-btn-col {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        .header-ind-col {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            justify-content: center;
+        }
+        /* All toggle buttons: fixed width, fixed font size, dot always on left */
         .status-toggle-btn {
             display: flex;
             align-items: center;
-            gap: 5px;
+            gap: 6px;
+            width: 140px;
             background: #1a1a1a;
             border: 1px solid #444;
             border-radius: 6px;
             padding: 5px 10px;
             color: #ccc;
-            font-size: 0.82em;
+            font-size: 0.8em;
             cursor: pointer;
             transition: border-color 0.2s;
             white-space: nowrap;
+            box-sizing: border-box;
         }
         .status-toggle-btn:hover { border-color: #666; }
         .status-toggle-btn .status-dot {
             width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
         }
-        .header-op-indicator {
+        .status-toggle-btn .btn-label { color: #aaa; }
+        .status-toggle-btn .btn-value { color: #666; font-size: 0.92em; }
+        /* Indicators in the right column */
+        .header-indicator {
             display: flex;
             align-items: center;
-            gap: 5px;
-            font-size: 0.82em;
+            gap: 6px;
+            font-size: 0.8em;
             color: #888;
             white-space: nowrap;
+            padding: 5px 0;
         }
-        .header-connectivity {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            font-size: 0.82em;
-            color: #888;
-            white-space: nowrap;
-        }
+        .header-indicator .status-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
         .tabs {
             display: flex;
             gap: 10px;
@@ -6477,36 +6535,40 @@ def index():
     <div class="container">
         <div class="header">
             <h1>MiFi Control Panel</h1>
-            <div class="header-status">
-                <!-- GPS toggle button -->
-                <button class="status-toggle-btn" onclick="toggleGPS()" title="Toggle GPS monitoring">
-                    <span class="status-dot red" id="gpsDot"></span>
-                    <span>GPS</span>
-                    <span id="gpsStatusShort" style="color:#666;">Off</span>
-                </button>
-                <!-- Interface toggle button -->
-                <button class="status-toggle-btn" onclick="toggleInterface()" title="Toggle monitor mode">
-                    <span class="status-dot" id="interfaceDot"></span>
-                    <span>Interface</span>
-                    <span id="interfaceStatusShort" style="color:#666;">Unknown</span>
-                </button>
-                <!-- TAK toggle button -->
-                <button class="status-toggle-btn" onclick="toggleTAKConnection()" title="Toggle TAK connection">
-                    <span class="status-dot" id="takDot"></span>
-                    <span>TAK</span>
-                    <span id="takStatusShort" style="color:#666;">Off</span>
-                </button>
-                <!-- Operation indicator (read-only) -->
-                <div class="header-op-indicator">
-                    <span class="status-dot" id="operationDot"></span>
-                    <span id="operationStatus">Idle</span>
+            <div class="header-right">
+                <!-- Buttons column: GPS, Interface, TAK -->
+                <div class="header-btn-col">
+                    <button class="status-toggle-btn" onclick="toggleGPS()" title="Toggle GPS monitoring">
+                        <span class="status-dot red" id="gpsDot"></span>
+                        <span class="btn-label">GPS</span>
+                        <span id="gpsStatusShort" class="btn-value">Off</span>
+                    </button>
+                    <button class="status-toggle-btn" onclick="toggleInterface()" title="Toggle monitor mode">
+                        <span class="status-dot" id="interfaceDot"></span>
+                        <span class="btn-label">Interface</span>
+                        <span id="interfaceStatusShort" class="btn-value">Unknown</span>
+                    </button>
+                    <button class="status-toggle-btn" onclick="toggleTAKConnection()" title="Toggle TAK connection">
+                        <span class="status-dot" id="takDot"></span>
+                        <span class="btn-label">TAK</span>
+                        <span id="takStatusShort" class="btn-value">Off</span>
+                    </button>
                 </div>
-            </div>
-            <div class="header-connectivity">
-                <span id="statusText" style="font-size:0.8em;"></span>
-                <span id="statusDot" class="status-dot red"></span>
-                <span style="margin-left:8px;">Net</span>
-                <span id="internetStatusDot" class="status-dot red" title="Internet"></span>
+                <!-- Indicators column: Operation, Server, Internet -->
+                <div class="header-ind-col">
+                    <div class="header-indicator">
+                        <span class="status-dot" id="operationDot"></span>
+                        <span id="operationStatus">Idle</span>
+                    </div>
+                    <div class="header-indicator">
+                        <span id="statusDot" class="status-dot red"></span>
+                        <span id="statusText">Server</span>
+                    </div>
+                    <div class="header-indicator">
+                        <span id="internetStatusDot" class="status-dot red"></span>
+                        <span>Internet</span>
+                    </div>
+                </div>
             </div>
         </div>
 
