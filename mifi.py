@@ -1205,11 +1205,6 @@ class wifi_cracker:
                     continue
                 if target in self.networks:
                     self.capture_handshake(target, target_scan=target_scan, packets=packets)
-                    self.log("Rescanning in 2 seconds...", prefix="dot", indent=4)
-                    time.sleep(2)
-                    if not self.scan_networks(timeout=initial_scan):
-                        self.log("Rescan failed.", prefix="error")
-                        return False
                     break  # Break inner loop to redisplay networks after capture
                 else:
                     self.log("Invalid ESSID selected. Please try again.", prefix="error")
@@ -1399,7 +1394,8 @@ class wifi_cracker:
                 proc.wait()
 
         if os.path.exists(cap_file):
-            self.log(f"Capture file {cap_file} found.", indent=4, prefix="check")
+            if self.verbose:
+                self.log(f"Capture file {cap_file} found.", indent=4, prefix="dot")
             eapol_check = self.has_eapol(cap_file)
             if eapol_check:
                 self.handshake_captured = True
@@ -4036,6 +4032,14 @@ if __name__ == "__main__":
                 suite.crack_hcx(cap_path, args.word_list, capture_id=args.capture_id)
 
         elif mode_type == "collect":
+            # Start GPS polling in the collect subprocess so coordinates are
+            # available when register_capture() fires on a confirmed EAPOL.
+            # Non-fatal: if GPS isn't toggled on or gpsd is unreachable,
+            # collection continues but captures will have NULL coordinates.
+            if not (suite.gps_thread and suite.gps_thread.is_alive()):
+                gps_active_from_parent = os.environ.get('MIFI_GPS_ACTIVE', '0') == '1'
+                if gps_active_from_parent:
+                    suite.start_gps_polling()
             suite.collect(
                 mode=mode_subtype,
                 packets=args.packets,

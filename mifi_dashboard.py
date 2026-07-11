@@ -1353,10 +1353,14 @@ def read_process_logs(process, stdout_file=None):
                                 # Read directly from raw file descriptor
                                 raw_chunk = os.read(fd, 1024)
                                 if raw_chunk:
+                                    # Decode with better error handling for box-drawing characters
                                     try:
-                                        chunk = raw_chunk.decode('utf-8', errors='replace')
+                                        chunk = raw_chunk.decode('utf-8', errors='surrogateescape')
+                                        # Replace any surrogate characters
+                                        if any(ord(c) >= 0xD800 and ord(c) <= 0xDFFF for c in chunk):
+                                            chunk = chunk.encode('utf-8', errors='surrogateescape').decode('utf-8', errors='replace')
                                     except UnicodeDecodeError:
-                                        chunk = raw_chunk.decode('latin-1')
+                                        chunk = raw_chunk.decode('utf-8', errors='replace')
                                     buffer += chunk
                                     buffer_unchanged_count = 0
                                     # Process any complete lines immediately
@@ -1478,11 +1482,17 @@ def read_process_logs(process, stdout_file=None):
                                 # os.read() called (debug output removed)
                                 raw_chunk = os.read(fd, 1024)
                                 # os.read() returned (debug output removed)
-                                # Decode with utf-8/replace - handles box-drawing characters correctly
+                                # Decode bytes to string - use 'surrogateescape' to preserve invalid bytes
+                                # then replace surrogates to handle box-drawing characters properly
                                 try:
-                                    chunk = raw_chunk.decode('utf-8', errors='replace')
+                                    chunk = raw_chunk.decode('utf-8', errors='surrogateescape')
+                                    # Replace any surrogate characters that couldn't be decoded
+                                    if any(ord(c) >= 0xD800 and ord(c) <= 0xDFFF for c in chunk):
+                                        chunk = chunk.encode('utf-8', errors='surrogateescape').decode('utf-8', errors='replace')
                                 except UnicodeDecodeError:
-                                    chunk = raw_chunk.decode('latin-1')
+                                    # Fallback to replace for truly invalid sequences
+                                    chunk = raw_chunk.decode('utf-8', errors='replace')
+                                # Decoded chunk (debug output removed)
                             finally:
                                 # Restore original flags
                                 fcntl.fcntl(fd, fcntl.F_SETFL, flags)
@@ -1603,10 +1613,14 @@ def read_process_logs(process, stdout_file=None):
                                         raw_quick_chunk = os.read(fd, 1024)
                                         if raw_quick_chunk:
                                             # Decode bytes to string
+                                            # Decode with better error handling for box-drawing characters
                                             try:
-                                                quick_chunk = raw_quick_chunk.decode('utf-8', errors='replace')
+                                                quick_chunk = raw_quick_chunk.decode('utf-8', errors='surrogateescape')
+                                                # Replace any surrogate characters
+                                                if any(ord(c) >= 0xD800 and ord(c) <= 0xDFFF for c in quick_chunk):
+                                                    quick_chunk = quick_chunk.encode('utf-8', errors='surrogateescape').decode('utf-8', errors='replace')
                                             except UnicodeDecodeError:
-                                                quick_chunk = raw_quick_chunk.decode('latin-1')
+                                                quick_chunk = raw_quick_chunk.decode('utf-8', errors='replace')
                                             # Quick read successful
                                             buffer += quick_chunk
                                             buffer_unchanged_count = 0  # Reset counter
@@ -2609,23 +2623,22 @@ def list_bssids():
 @app.route('/api/captures')
 def list_captures():
     """
-    Returns the consolidated capture inventory: one entry per captures row,
-    each with its nested processing_runs (sub-rows) and any crack_results.
-    This is the data source for the Analysis tab's collapsible table and map.
+    Returns capture inventory grouped by ESSID -- one entry per unique network,
+    each containing its captures[] array. Each capture contains its
+    processing_runs[] and crack_results[]. Drives the three-level Analysis tab
+    table: ESSID row > capture sub-row > attempt sub-sub-row.
     """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute('SELECT * FROM captures WHERE cap_deleted = 0 ORDER BY captured_at DESC')
-    captures = [dict(row) for row in c.fetchall()]
+    all_caps = [dict(row) for row in c.fetchall()]
 
-    for cap in captures:
+    for cap in all_caps:
         c.execute('SELECT * FROM processing_runs WHERE capture_id = ? ORDER BY started_at', (cap['id'],))
         cap['processing_runs'] = [dict(r) for r in c.fetchall()]
         c.execute('SELECT * FROM crack_results WHERE capture_id = ? ORDER BY cracked_at', (cap['id'],))
         cap['crack_results'] = [dict(r) for r in c.fetchall()]
-        # Derived status for the row's color/badge -- cracked takes priority,
-        # then a still-running attempt, then exhausted/failed, else untouched.
         if cap['crack_results']:
             cap['status'] = 'cracked'
         elif any(r['status'] == 'running' for r in cap['processing_runs']):
@@ -2635,8 +2648,35 @@ def list_captures():
         else:
             cap['status'] = 'unprocessed'
 
+    # Group by ESSID
+    seen = {}
+    for cap in all_caps:
+        essid = cap['essid']
+        if essid not in seen:
+            seen[essid] = {'essid': essid, 'bssid': cap['bssid'], 'captures': [],
+                           'gps_lat': None, 'gps_lon': None}
+        seen[essid]['captures'].append(cap)
+        if cap['gps_lat'] and not seen[essid]['gps_lat']:
+            seen[essid]['gps_lat'] = cap['gps_lat']
+            seen[essid]['gps_lon'] = cap['gps_lon']
+
+    grouped = list(seen.values())
+    for g in grouped:
+        statuses = [cap['status'] for cap in g['captures']]
+        if 'cracked' in statuses:
+            g['status'] = 'cracked'
+            g['password'] = next((cr['password'] for cap in g['captures']
+                                  for cr in cap['crack_results']), None)
+        elif 'processing' in statuses:
+            g['status'] = 'processing'; g['password'] = None
+        elif 'attempted' in statuses:
+            g['status'] = 'attempted'; g['password'] = None
+        else:
+            g['status'] = 'unprocessed'; g['password'] = None
+
     conn.close()
-    return jsonify(captures)
+    return jsonify(grouped)
+
 
 @app.route('/api/captures/<int:capture_id>/process', methods=['POST'])
 def process_capture(capture_id):
@@ -6084,19 +6124,55 @@ def index():
         }
         .header {
             background: #2d2d2d;
-            padding: 20px;
+            padding: 12px 20px;
             border-radius: 8px;
             margin-bottom: 20px;
             display: flex;
             justify-content: space-between;
             align-items: center;
+            gap: 16px;
         }
-        .header > div {
+        .header h1 { color: #4CAF50; margin: 0; font-size: 1.3em; white-space: nowrap; }
+        .header-status {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .status-toggle-btn {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            background: #1a1a1a;
+            border: 1px solid #444;
+            border-radius: 6px;
+            padding: 5px 10px;
+            color: #ccc;
+            font-size: 0.82em;
+            cursor: pointer;
+            transition: border-color 0.2s;
+            white-space: nowrap;
+        }
+        .status-toggle-btn:hover { border-color: #666; }
+        .status-toggle-btn .status-dot {
+            width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
+        }
+        .header-op-indicator {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 0.82em;
+            color: #888;
+            white-space: nowrap;
+        }
+        .header-connectivity {
             display: flex;
             align-items: center;
             gap: 8px;
+            font-size: 0.82em;
+            color: #888;
+            white-space: nowrap;
         }
-        .header h1 { color: #4CAF50; }
         .tabs {
             display: flex;
             gap: 10px;
@@ -6205,7 +6281,7 @@ def index():
         }
         .operation-mode-grid {
             display: grid;
-            grid-template-columns: repeat(3, 1fr);
+            grid-template-columns: repeat(5, 1fr);
             grid-template-rows: auto auto;
             gap: 10px;
             margin-bottom: 20px;
@@ -6237,16 +6313,24 @@ def index():
             grid-column: 1;
             grid-row: 1;
         }
-        #modeTarget {
+        #modeProcess {
             grid-column: 2;
+            grid-row: 1;
+        }
+        #modeFull {
+            grid-column: 3;
+            grid-row: 1;
+        }
+        #modeTarget {
+            grid-column: 4;
             grid-row: 1 / 3;
         }
         #modeMap {
-            grid-column: 3;
+            grid-column: 5;
             grid-row: 1 / 3;
         }
         #modeAuto {
-            grid-column: 1;
+            grid-column: 1 / 4;
             grid-row: 2;
         }
         .operation-mode-spacer {
@@ -6393,49 +6477,48 @@ def index():
     <div class="container">
         <div class="header">
             <h1>MiFi Control Panel</h1>
-            <div>
-                <span id="statusText">Initializing...</span>
-                <span id="statusDot" class="status-dot red" style="margin-right: 8px; display: inline-block;"></span>
-                <span style="margin-left: 16px;">Internet</span>
-                <span id="internetStatusDot" class="status-dot red" style="margin-left: 8px; display: inline-block;" title="Internet Connectivity"></span>
+            <div class="header-status">
+                <!-- GPS toggle button -->
+                <button class="status-toggle-btn" onclick="toggleGPS()" title="Toggle GPS monitoring">
+                    <span class="status-dot red" id="gpsDot"></span>
+                    <span>GPS</span>
+                    <span id="gpsStatusShort" style="color:#666;">Off</span>
+                </button>
+                <!-- Interface toggle button -->
+                <button class="status-toggle-btn" onclick="toggleInterface()" title="Toggle monitor mode">
+                    <span class="status-dot" id="interfaceDot"></span>
+                    <span>Interface</span>
+                    <span id="interfaceStatusShort" style="color:#666;">Unknown</span>
+                </button>
+                <!-- TAK toggle button -->
+                <button class="status-toggle-btn" onclick="toggleTAKConnection()" title="Toggle TAK connection">
+                    <span class="status-dot" id="takDot"></span>
+                    <span>TAK</span>
+                    <span id="takStatusShort" style="color:#666;">Off</span>
+                </button>
+                <!-- Operation indicator (read-only) -->
+                <div class="header-op-indicator">
+                    <span class="status-dot" id="operationDot"></span>
+                    <span id="operationStatus">Idle</span>
+                </div>
+            </div>
+            <div class="header-connectivity">
+                <span id="statusText" style="font-size:0.8em;"></span>
+                <span id="statusDot" class="status-dot red"></span>
+                <span style="margin-left:8px;">Net</span>
+                <span id="internetStatusDot" class="status-dot red" title="Internet"></span>
             </div>
         </div>
 
         <div class="tabs">
-            <button class="tab active" onclick="switchTab('collect', event)">Collect</button>
+            <button class="tab active" onclick="switchTab('control', event)">Control</button>
             <button class="tab" onclick="switchTab('map', event)">Map</button>
             <button class="tab" onclick="switchTab('analysis', event)">Analysis</button>
             <button class="tab" onclick="switchTab('config', event)">Config</button>
         </div>
 
         <!-- Control Tab -->
-        <div id="collectTab" class="tab-content active">
-            <div class="status-panel">
-                <h2>System Status</h2>
-                <div class="status-grid">
-                    <div class="status-item clickable" onclick="toggleGPS()">
-                        <div class="status-dot red" id="gpsDot"></div>
-                        <div class="status-label">GPS:</div>
-                        <div class="status-value" id="gpsStatus">GPS Disabled</div>
-                    </div>
-                    <div class="status-item clickable" onclick="toggleInterface()">
-                        <div class="status-dot" id="interfaceDot"></div>
-                        <div class="status-label">Interface:</div>
-                        <div class="status-value" id="interfaceStatus">Unknown</div>
-                    </div>
-                    <div class="status-item clickable" onclick="toggleTAKConnection()">
-                        <div class="status-dot" id="takDot"></div>
-                        <div class="status-label">TAK:</div>
-                        <div class="status-value" id="takStatus">TAK Disabled</div>
-                    </div>
-                    <div class="status-item">
-                        <div class="status-dot" id="operationDot"></div>
-                        <div class="status-label">Operation:</div>
-                        <div class="status-value" id="operationStatus">None</div>
-                    </div>
-                </div>
-            </div>
-
+        <div id="controlTab" class="tab-content active">
             <div class="control-panel">
                 <h2>Operation Controls</h2>
                 <div class="operation-mode-grid">
@@ -6724,8 +6807,6 @@ def index():
                         console.error('[ERROR] loadDashboard is not a function! Type:', typeof loadDashboard);
                     }
                 }, 100);
-            } else if (tabName === 'collect') {
-                // Control tab - no special init needed
             } else if (tabName === 'analysis') {
                 loadCaptures();
             }
@@ -7508,77 +7589,77 @@ def index():
             return '<span class="status-badge ' + cls + '">' + label + '</span>';
         }
 
-        function renderCapturesTable(captures) {
+        function renderCapturesTable(grouped) {
             const tbody = document.getElementById('capturesTableBody');
-            if (!captures.length) {
-                tbody.innerHTML = '<tr><td colspan="7" style="text-align:center; color:#666; padding:20px;">No captures yet. Confirmed EAPOL handshakes will appear here after collection.</td></tr>';
+            if (!grouped.length) {
+                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:#666; padding:20px;">No captures yet. Confirmed EAPOL handshakes will appear here after collection.</td></tr>';
                 return;
             }
             let html = '';
-            captures.forEach((cap, idx) => {
-                const password = cap.crack_results.length ? cap.crack_results[cap.crack_results.length - 1].password : '';
+            grouped.forEach((g, idx) => {
                 const borderTop = idx > 0 ? 'border-top:2px solid #444;' : '';
-                html += `<tr style="cursor:pointer; ${borderTop}" onclick="toggleCaptureRow(${cap.id})">` +
-                    `<td id="caret-${cap.id}" style="width:20px; color:#888; padding-right:4px;">&#9656;</td>` +
-                    `<td style="font-weight:600;">${cap.essid}</td>` +
-                    `<td style="font-family:monospace; font-size:0.88em; color:#ccc;">${cap.bssid}</td>` +
-                    `<td style="text-align:center; color:#aaa;">${cap.channel || '\u2014'}</td>` +
-                    `<td style="font-size:0.88em; color:#888;">${cap.captured_at}</td>` +
-                    `<td>${statusBadge(cap.status)}${password ? ` <code style="margin-left:6px; color:#4CAF50; font-size:0.9em;">${password}</code>` : ''}</td>` +
-                    `<td style="white-space:nowrap;" onclick="event.stopPropagation();">` +
-                        `<button class="btn btn-primary" style="padding:4px 10px; font-size:0.82em; margin-right:4px;" onclick="selectCaptureForProcessing(${cap.id})">Select</button>` +
-                        `<button class="btn btn-danger" style="padding:4px 10px; font-size:0.82em;" data-delete-id="${cap.id}" onclick="deleteCaptureRow(${cap.id})">Delete</button>` +
-                    `</td>` +
-                `</tr>`;
+                const caretId = 'caret-g-' + idx;
+                const subId = 'subrows-g-' + idx;
+                html += `<tr style="cursor:pointer; ${borderTop}" onclick="toggleCaptureRow('${subId}','${caretId}')">` +
+                    `<td id="${caretId}" style="width:20px; color:#888;">&#9656;</td>` +
+                    `<td style="font-weight:600;">${g.essid}</td>` +
+                    `<td style="font-family:monospace; font-size:0.88em; color:#ccc;">${g.bssid}</td>` +
+                    `<td style="text-align:center;">${g.captures.length} capture${g.captures.length !== 1 ? 's' : ''}</td>` +
+                    `<td>${statusBadge(g.status)}${g.password ? ` <code style="margin-left:6px; color:#4CAF50;">${g.password}</code>` : ''}</td>` +
+                    `<td></td></tr>`;
 
-                html += `<tr id="subrows-${cap.id}" style="display:none;">` +
-                    `<td style="border-top:1px solid #333;"></td>` +
-                    `<td colspan="6" style="border-top:1px solid #333; padding:2px 0 10px 12px; background:#1c1c1c;">`;
+                html += `<tr id="${subId}" style="display:none;"><td></td><td colspan="5" style="padding:0 0 8px 12px; background:#1c1c1c;">`;
+                g.captures.forEach((cap, cidx) => {
+                    const capCaretId = 'caret-c-' + cap.id;
+                    const capSubId = 'subrows-c-' + cap.id;
+                    html += `<div style="margin:6px 0;">` +
+                        `<div style="display:flex; align-items:center; gap:10px; cursor:pointer; padding:4px 0; border-top:${cidx > 0 ? '1px solid #2a2a2a' : 'none'};" onclick="toggleCaptureRow('${capSubId}','${capCaretId}')">` +
+                        `<span id="${capCaretId}" style="color:#666; font-size:0.8em;">&#9656;</span>` +
+                        `<span style="font-size:0.85em; color:#888; font-family:monospace;">${cap.captured_at}</span>` +
+                        `<span style="font-size:0.82em; color:#666;">ch${cap.channel || '?'}</span>` +
+                        `${statusBadge(cap.status)}` +
+                        `<span style="margin-left:auto; display:flex; gap:6px;" onclick="event.stopPropagation();">` +
+                            `<button class="btn btn-primary" style="padding:2px 8px; font-size:0.78em;" onclick="selectCaptureForProcessing(${cap.id},'${g.essid}')">Select</button>` +
+                            `<button class="btn btn-danger" style="padding:2px 8px; font-size:0.78em;" data-delete-id="${cap.id}" onclick="deleteCaptureRow(${cap.id})">Delete</button>` +
+                        `</span></div>` +
+                        `<div id="${capSubId}" style="display:none; padding:2px 0 4px 16px;">`;
 
-                if (!cap.processing_runs.length) {
-                    html += `<div style="color:#555; font-size:0.82em; padding:4px 0 2px;">No processing attempts yet.</div>`;
-                } else {
-                    html += `<table style="width:100%; border-collapse:collapse; font-size:0.82em; color:#aaa;">` +
-                        `<thead><tr style="border-bottom:1px solid #2e2e2e;">` +
-                        `<th style="text-align:left; padding:3px 10px 3px 0; font-weight:400; color:#666;">Tool</th>` +
-                        `<th style="text-align:left; padding:3px 10px 3px 0; font-weight:400; color:#666;">Profile</th>` +
-                        `<th style="text-align:left; padding:3px 10px 3px 0; font-weight:400; color:#666;">Started</th>` +
-                        `<th style="text-align:left; padding:3px 10px 3px 0; font-weight:400; color:#666;">Completed</th>` +
-                        `<th style="text-align:left; padding:3px 0; font-weight:400; color:#666;">Status</th>` +
-                        `</tr></thead><tbody>`;
-                    cap.processing_runs.forEach((run, ridx) => {
-                        const runBorder = ridx > 0 ? 'border-top:1px dashed #252525;' : '';
-                        const runStatus = run.status === 'cracked' ? 'cracked' : (run.status === 'running' ? 'processing' : 'attempted');
-                        html += `<tr style="${runBorder}">` +
-                            `<td style="padding:3px 10px 3px 0;">${run.tool}</td>` +
-                            `<td style="padding:3px 10px 3px 0; color:#777;">${run.attack_profile || '\u2014'}</td>` +
-                            `<td style="padding:3px 10px 3px 0; color:#666; font-size:0.95em;">${run.started_at}</td>` +
-                            `<td style="padding:3px 10px 3px 0; color:#666; font-size:0.95em;">${run.completed_at || '\u2014'}</td>` +
-                            `<td style="padding:3px 0;">${statusBadge(runStatus)}</td>` +
-                        `</tr>`;
-                    });
-                    html += `</tbody></table>`;
-                }
+                    if (!cap.processing_runs.length) {
+                        html += `<div style="color:#555; font-size:0.8em;">No processing attempts.</div>`;
+                    } else {
+                        cap.processing_runs.forEach((run, ridx) => {
+                            const runStatus = run.status === 'cracked' ? 'cracked' : (run.status === 'running' ? 'processing' : 'attempted');
+                            html += `<div style="display:flex; gap:12px; font-size:0.8em; color:#777; padding:2px 0; ${ridx > 0 ? 'border-top:1px dashed #252525;' : ''}">` +
+                                `<span>${run.tool}</span>` +
+                                `<span style="color:#555;">${run.attack_profile || ''}</span>` +
+                                `<span style="color:#555;">${run.started_at}</span>` +
+                                `<span>${statusBadge(runStatus)}</span>` +
+                            `</div>`;
+                        });
+                    }
+                    html += `</div></div>`;
+                });
                 html += `</td></tr>`;
             });
             tbody.innerHTML = html;
         }
 
-        function toggleCaptureRow(id) {
-            const row = document.getElementById('subrows-' + id);
-            const caret = document.getElementById('caret-' + id);
+        function toggleCaptureRow(subId, caretId) {
+            const row = document.getElementById(subId);
+            const caret = document.getElementById(caretId);
             if (!row) return;
             const isOpen = row.style.display !== 'none';
-            row.style.display = isOpen ? 'none' : 'table-row';
-            caret.innerHTML = isOpen ? '&#9656;' : '&#9662;';
+            row.style.display = isOpen ? 'none' : (row.tagName === 'TR' ? 'table-row' : 'block');
+            if (caret) caret.innerHTML = isOpen ? '&#9656;' : '&#9662;';
         }
 
-        function selectCaptureForProcessing(id) {
-            analysisSelectedCaptureId = id;
-            const cap = analysisCapturesCache.find(c => c.id === id);
-            document.getElementById('analysisSelectedCapture').value = cap ? (cap.essid + ' (' + cap.bssid + ')') : ('Capture #' + id);
+
+        function selectCaptureForProcessing(capId, essid) {
+            analysisSelectedCaptureId = capId;
+            document.getElementById('analysisSelectedCapture').value = essid + ' (capture #' + capId + ')';
             document.getElementById('analysisExecuteBtn').disabled = false;
         }
+
 
         function executeAnalysisProcess() {
             if (!analysisSelectedCaptureId) return;
@@ -7645,32 +7726,28 @@ def index():
             }
         }
 
-        function renderAnalysisMap(captures) {
+        function renderAnalysisMap(grouped) {
             const el = document.getElementById('analysisMap');
             if (!el) return;
             if (!analysisMapInstance) {
                 analysisMapInstance = L.map('analysisMap', {maxZoom: 18}).setView([0, 0], 2);
                 L.tileLayer('http://10.0.1.3:8080/data/globe/{z}/{x}/{y}.png', {maxZoom: 18}).addTo(analysisMapInstance);
             }
-            // Clear existing markers
             analysisMapInstance.eachLayer(layer => {
                 if (layer instanceof L.CircleMarker) analysisMapInstance.removeLayer(layer);
             });
-
-            const pts = captures.filter(c => c.gps_lat && c.gps_lon);
+            const pts = grouped.filter(g => g.gps_lat && g.gps_lon);
             if (!pts.length) return;
-
-            pts.forEach(cap => {
-                const color = cap.status === 'cracked' ? '#4CAF50' : (cap.status === 'processing' ? '#ffb300' : '#f44336');
-                const marker = L.circleMarker([cap.gps_lat, cap.gps_lon], {
-                    radius: 8, color: color, fillColor: color, fillOpacity: 0.8, weight: 2
-                }).addTo(analysisMapInstance);
-                marker.bindPopup('<b>' + cap.essid + '</b><br>' + cap.bssid + '<br>' + statusBadge(cap.status));
+            pts.forEach(g => {
+                const color = g.status === 'cracked' ? '#4CAF50' : (g.status === 'processing' ? '#ffb300' : '#f44336');
+                L.circleMarker([g.gps_lat, g.gps_lon], {
+                    radius: 8, color, fillColor: color, fillOpacity: 0.8, weight: 2
+                }).addTo(analysisMapInstance)
+                  .bindPopup(`<b>${g.essid}</b><br>${g.bssid}<br>${g.captures.length} capture(s)`);
             });
-
-            const bounds = L.latLngBounds(pts.map(c => [c.gps_lat, c.gps_lon]));
-            analysisMapInstance.fitBounds(bounds, {padding: [30, 30]});
+            analysisMapInstance.fitBounds(L.latLngBounds(pts.map(g => [g.gps_lat, g.gps_lon])), {padding: [30, 30]});
         }
+
 
         function loadConfig() {
             fetch('/api/config')
@@ -7901,19 +7978,13 @@ def index():
             };
             
             const dotId = type + 'Dot';
-            const valueId = type + 'Status';
             const dot = document.getElementById(dotId);
-            const value = document.getElementById(valueId);
+            // Legacy full-text element (may not exist now that status is in header)
+            const value = document.getElementById(type + 'Status');
+            // Header short-label element
+            const shortEl = document.getElementById(type + 'StatusShort');
             
-            if (!dot || !value) {
-                // Only log as warning for operation status since it's optional
-                if (type !== 'operation') {
-                    console.error(`[ERROR] Status elements not found for type: ${type}`);
-                    if (!dot) console.error(`[ERROR] Element ${dotId} not found`);
-                    if (!value) console.error(`[ERROR] Element ${valueId} not found`);
-                }
-                return;
-            }
+            if (!dot) return;  // dot is required; value/shortEl are optional
             
             // Determine color based on status
             let color = 'red'; // Default to red for unknown/error states
@@ -7947,24 +8018,31 @@ def index():
                 }
             }
             
-            // Get display text
+            // Get display text -- short version for header badge, full for legacy panel
             const displayText = statusMap[type]?.[status] || status;
-            
+            const shortText = {
+                'gps': {'disabled':'Off','no_modules':'Off','no_device':'Off',
+                        'no_data':'No Data','searching':'Searching','locked':'Locked','unknown':'?'},
+                'interface': {'monitor_mode':'Monitor','managed_mode':'Managed',
+                              'no_interface':'None','unknown':'?'},
+                'tak': {'connected':'Connected','enabled':'Enabled','disabled':'Off','unknown':'?'},
+                'operation': {}
+            }[type]?.[status] || status;
+
             // Update DOM
             dot.className = 'status-dot ' + color;
-            value.textContent = displayText;
-            
-            // Force a reflow to ensure changes are visible
+            if (value) { value.textContent = displayText; void value.offsetHeight; }
+            if (shortEl) shortEl.textContent = shortText;
+
+            // Force reflow
             void dot.offsetHeight;
-            void value.offsetHeight;
         }
 
         function toggleGPS() {
             const gpsDot = document.getElementById('gpsDot');
-            const gpsStatus = document.getElementById('gpsStatus');
-            
-            const currentStatus = gpsStatus ? gpsStatus.textContent.trim() : 'unknown';
-            const isCurrentlyEnabled = currentStatus.includes('Locked') || currentStatus.includes('Searching') || currentStatus.includes('No USB Device') || currentStatus.includes('No GPS Data');
+            const gpsShort = document.getElementById('gpsStatusShort');
+            const currentStatus = gpsShort ? gpsShort.textContent.trim() : 'unknown';
+            const isCurrentlyEnabled = !['Off', 'unknown'].includes(currentStatus);
             
             addLog('Toggling GPS monitoring...', 'info');
             
@@ -8066,8 +8144,7 @@ def index():
         }
 
         function toggleInterface() {
-            
-            const statusEl = document.getElementById('interfaceStatus');
+            const statusEl = document.getElementById('interfaceStatusShort');
             const currentStatus = statusEl ? statusEl.textContent.trim() : '';
             
             fetch('/api/interface/toggle', {
@@ -8100,10 +8177,10 @@ def index():
         
         function toggleTAKConnection() {
             const takDot = document.getElementById('takDot');
-            const takStatus = document.getElementById('takStatus');
+            const takStatus = document.getElementById('takStatusShort');
             
             const currentStatus = takStatus ? takStatus.textContent.trim() : 'unknown';
-            const isCurrentlyConnected = currentStatus.includes('Connected');
+            const isCurrentlyConnected = currentStatus === 'Connected';
             
             // Prevent multiple simultaneous requests
             if (takDot && takDot.style.pointerEvents === 'none') {
