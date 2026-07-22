@@ -7834,7 +7834,7 @@ def index():
                     `<td style="font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:0;" title="${g.essid}">${g.essid}</td>` +
                     `<td style="font-family:monospace; font-size:0.88em; color:#ccc; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:0;" title="${g.bssid}">${g.bssid}</td>` +
                     `<td style="text-align:center; color:#888; font-size:0.88em;">${g.captures.length} capture${g.captures.length !== 1 ? 's' : ''}</td>` +
-                    `<td>${statusBadge(g.status)}${g.password ? ` <code style="margin-left:6px; color:#4CAF50;">${g.password}</code>` : ''}</td>` +
+                    '<td>' + statusBadge(g.status) + (g.password ? ' <code style="margin-left:6px; color:#4CAF50;">' + g.password + '</code>' : '') + '</td>' +
                     `<td></td></tr>`;
 
                 html += `<tr id="${subId}" style="display:none;"><td></td><td colspan="5" style="padding:0 0 8px 4px; background:#1c1c1c;">`;
